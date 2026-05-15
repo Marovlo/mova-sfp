@@ -26,12 +26,12 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
 import torch.nn as nn
 
 from mova.diffusion.pipelines.mova_train import MOVATrain, MOVATrain_from_pretrained
+from mova.distill.utils.scheduler_distill import FlowMatchSchedulerDistill
 
 
 @dataclass
@@ -44,9 +44,6 @@ class MOVADistillModules:
     real_low: nn.Module             # frozen teacher (deep-copied)
     fake_high: nn.Module            # trainable critic (deep-copied)
     fake_low: nn.Module             # trainable critic (deep-copied)
-    # high_noise_teacher is filled in lazily for the second (low) stage; it is
-    # the *generator_high* state captured at the end of the first stage.
-    distilled_high_state: Optional[dict] = None
 
 
 def _deepcopy_dit(module: nn.Module) -> nn.Module:
@@ -86,6 +83,14 @@ def build_distill_modules(
         torch_dtype=torch_dtype,
         use_gradient_checkpointing=use_gradient_checkpointing,
         use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
+    )
+
+    # Replace the default FlowMatchScheduler with the distill-aware version
+    # that has add_noise_high/low, get_train_sigmas, etc.
+    orig = master.scheduler
+    master.scheduler = FlowMatchSchedulerDistill(
+        num_train_timesteps=getattr(orig, "num_train_timesteps", 1000),
+        shift=getattr(orig, "shift", 5.0),
     )
 
     # --- build clones ---

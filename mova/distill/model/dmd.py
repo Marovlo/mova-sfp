@@ -242,7 +242,7 @@ class MOVADMD(torch.nn.Module):
                 y=y, cp_mesh=cp_mesh,
             )
 
-        bsz, num_frame = image_or_video_shape[:2]
+        bsz, num_frame = generated.shape[:2]
         critic_t = self._get_timestep(self.min_timestep, self.max_timestep, bsz, num_frame,
                                       self.num_frame_per_block, uniform_timestep=True)
         critic_t = critic_t.clamp(self.min_step, self.max_step)
@@ -253,12 +253,12 @@ class MOVADMD(torch.nn.Module):
             noisy_gen = self.scheduler.add_noise_high(
                 generated.flatten(0, 1), critic_noise.flatten(0, 1),
                 critic_id.flatten(0, 1), self.timestep_bound,
-            ).unflatten(0, image_or_video_shape[:2])
+            ).unflatten(0, (bsz, num_frame))
         else:
             noisy_gen = self.scheduler.add_noise_low(
                 generated.flatten(0, 1), critic_noise.flatten(0, 1),
                 critic_id.flatten(0, 1), self.timestep_bound,
-            ).unflatten(0, image_or_video_shape[:2])
+            ).unflatten(0, (bsz, num_frame))
 
         flow_pred_fake, _ = self.fake_score(
             noisy_image_or_video=noisy_gen,

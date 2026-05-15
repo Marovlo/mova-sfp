@@ -240,25 +240,36 @@ class DistillationTrainer:
         """
         pipe = self.master
         B = img_rgb.shape[0]
-        _, C, H, W = img_rgb.shape
-        num_frames = self.config.image_or_video_shape[1]  # F_lat (e.g. 21)
-        # MOVA: F_lat = (num_frames_video - 1) / 4 + 1
-        # We need the raw-frame count to build the full vae input
+        cfg_shape = self.config.image_or_video_shape  # [B, F_lat, C, H_lat, W_lat]
+        num_frames = cfg_shape[1]  # F_lat (e.g. 21)
+        H_lat, W_lat = cfg_shape[3], cfg_shape[4]
+        # Target pixel resolution = latent × vae_stride (8)
+        target_H = H_lat * 8
+        target_W = W_lat * 8
+        C = img_rgb.shape[1]
         num_raw_frames = (num_frames - 1) * 4 + 1  # 81 for F_lat=21
+
+        # Resize img to target resolution if needed
+        if img_rgb.shape[2] != target_H or img_rgb.shape[3] != target_W:
+            img_rgb = torch.nn.functional.interpolate(
+                img_rgb, size=(target_H, target_W), mode="bilinear", align_corners=False,
+            )
 
         with torch.no_grad(), torch.autocast("cuda", dtype=self.dtype):
             vae_input = torch.cat([
                 img_rgb.unsqueeze(2),  # [B, C, 1, H, W]
-                torch.zeros(B, C, num_raw_frames - 1, H, W, device=img_rgb.device, dtype=img_rgb.dtype),
+                torch.zeros(B, C, num_raw_frames - 1, target_H, target_W,
+                            device=img_rgb.device, dtype=img_rgb.dtype),
             ], dim=2)
             y_vae = pipe.video_vae.encode(vae_input).latent_dist.mode()
             y_vae = pipe.normalize_video_latents(y_vae)
 
         # Build mask: [B, 4, F_lat, H_lat, W_lat]
-        H_lat = y_vae.shape[3]
-        W_lat = y_vae.shape[4]
         F_lat = y_vae.shape[2]
-        msk = torch.zeros(B, 4, F_lat, H_lat, W_lat, device=y_vae.device, dtype=y_vae.dtype)
+        H_lat_actual = y_vae.shape[3]
+        W_lat_actual = y_vae.shape[4]
+        msk = torch.zeros(B, 4, F_lat, H_lat_actual, W_lat_actual,
+                          device=y_vae.device, dtype=y_vae.dtype)
         msk[:, :, 0, :, :] = 1
         y = torch.cat([msk, y_vae], dim=1)  # [B, 20, F_lat, H_lat, W_lat]
         return y
@@ -370,13 +381,21 @@ class DistillationTrainer:
     # ============================================================
     def save(self):
         cfg = self.config
-        active = self.model.generator.video_dit_high \
-            if cfg.training_target == "high_noise" else self.model.generator.video_dit_low
-        gen_sd = fsdp_state_dict(active)
+        is_high = cfg.training_target == "high_noise"
+        gen_dit = self.model.generator.video_dit_high if is_high else self.model.generator.video_dit_low
+        crit_dit = self.model.fake_score.video_dit_high if is_high else self.model.fake_score.video_dit_low
+
+        gen_sd = fsdp_state_dict(gen_dit)
+        crit_sd = fsdp_state_dict(crit_dit)
+
+        state = {"generator": gen_sd, "critic": crit_sd}
+        if self.generator_ema is not None and self.ema_weight > 0:
+            state["generator_ema"] = self.generator_ema.state_dict()
+
         if self.is_main:
             ckpt_dir = os.path.join(cfg.logdir, f"checkpoint_step_{self.step:06d}")
             os.makedirs(ckpt_dir, exist_ok=True)
-            torch.save({"generator": gen_sd}, os.path.join(ckpt_dir, "model.pt"))
+            torch.save(state, os.path.join(ckpt_dir, "model.pt"))
             print(f"[Save] {ckpt_dir}/model.pt")
 
     # ============================================================
