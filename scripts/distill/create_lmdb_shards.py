@@ -7,14 +7,14 @@ Port of Self-Forcing-Plus `scripts/create_lmdb_14b_shards.py`, adapted to MOVA.
 Usage:
     python scripts/distill/create_lmdb_shards.py \
         --data_path /data/vae_latents \
-        --prompt_path /data/prompts \
-        --video_path /data/videos \
+        --json_path /data/train_data.json \
         --lmdb_path /data/lmdb_shards \
         --num_shards 16
 """
 
 import argparse
 import glob
+import json
 import os
 
 import imageio
@@ -30,8 +30,7 @@ import torch
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_path", required=True, help="Folder with per-sample .pt latents")
-    parser.add_argument("--prompt_path", required=True, help="Folder with per-video .txt prompts")
-    parser.add_argument("--video_path", required=True, help="Folder with raw video files (for first frame)")
+    parser.add_argument("--json_path", required=True, help="Path to JSON file containing video_path and caption pairs")
     parser.add_argument("--lmdb_path", required=True, help="Output lmdb directory")
     parser.add_argument("--num_shards", type=int, default=16)
     parser.add_argument("--min_prompt_len", type=int, default=300,
@@ -48,16 +47,18 @@ def main():
                                readonly=False, metasync=True, sync=True,
                                lock=True, readahead=False, meminit=False))
 
-    # Build prompt → filename map
+    # Build prompt → video_path map from JSON file
     prompt_to_fname = {}
     neg_prompts = set()
-    for pf in sorted(glob.glob(os.path.join(args.prompt_path, "*.txt"))):
-        with open(pf, "r", encoding="utf-8") as f:
-            txt = f.read().strip()
-        if len(txt) < args.min_prompt_len:
-            neg_prompts.add(txt)
+    with open(args.json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    for item in data:
+        caption = item["caption"]
+        video_path = item["video_path"]
+        if len(caption) < args.min_prompt_len:
+            neg_prompts.add(caption)
             continue
-        prompt_to_fname[txt] = os.path.basename(pf)
+        prompt_to_fname[caption] = video_path
 
     if neg_prompts:
         print(f"Skipping {len(neg_prompts)} short prompts")
@@ -94,8 +95,7 @@ def main():
         # Find matching first frame
         if prompt_txt not in prompt_to_fname:
             continue
-        video_fname = prompt_to_fname[prompt_txt].replace(".txt", ".mp4")
-        video_full = os.path.join(args.video_path, video_fname)
+        video_full = prompt_to_fname[prompt_txt]
         if not os.path.exists(video_full):
             continue
         try:

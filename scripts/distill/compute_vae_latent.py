@@ -10,13 +10,13 @@ saved as a .pt dict {prompt_string: latent_tensor}.
 Usage:
     torchrun --nproc_per_node=8 scripts/distill/compute_vae_latent.py \
         --ckpt_path /path/to/MOVA-720p \
-        --input_video_folder /data/videos \
-        --prompt_folder /data/prompts \
+        --json_path /data/train_data.json \
         --output_latent_folder /data/vae_latents
 """
 
 import argparse
 import glob
+import json
 import math
 import os
 
@@ -43,8 +43,7 @@ def encode_video(vae, video_tensor, latents_mean, latents_std):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt_path", required=True, help="MOVA pretrained dir")
-    parser.add_argument("--input_video_folder", required=True)
-    parser.add_argument("--prompt_folder", required=True)
+    parser.add_argument("--json_path", required=True, help="Path to JSON file containing video_path and caption pairs")
     parser.add_argument("--output_latent_folder", required=True)
     args = parser.parse_args()
 
@@ -61,21 +60,16 @@ def main():
     latents_mean = vae.config.latents_mean
     latents_std = vae.config.latents_std
 
-    # Gather (prompt, video_path) pairs
-    exts = ["*.mp4", "*.avi", "*.mov", "*.mkv", "*.webm"]
-    video_files = []
-    for ext in exts:
-        video_files.extend(glob.glob(os.path.join(args.input_video_folder, ext)))
-    video_files.sort()
+    # Gather (prompt, video_path) pairs from JSON file
+    with open(args.json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
 
     pairs = []
-    for vf in video_files:
-        stem = os.path.splitext(os.path.basename(vf))[0]
-        pf = os.path.join(args.prompt_folder, stem + ".txt")
-        if os.path.exists(pf):
-            with open(pf, "r", encoding="utf-8") as f:
-                prompt = f.read().strip()
-            pairs.append((prompt, vf))
+    for item in data:
+        video_path = item["video_path"]
+        caption = item["caption"]
+        if os.path.exists(video_path):
+            pairs.append((caption, video_path))
 
     os.makedirs(args.output_latent_folder, exist_ok=True)
 
