@@ -25,8 +25,7 @@ MASTER_PORT=${MASTER_PORT:-29500}
 RDZV_ID=${RDZV_ID:-mova_distill}
 
 CKPT_PATH=${CKPT_PATH:-/path/to/MOVA-720p}
-VIDEO_DIR=${VIDEO_DIR:-/data/videos}
-PROMPT_DIR=${PROMPT_DIR:-/data/prompts}
+JSON_PATH=${JSON_PATH:-/data/train_data.json}
 LATENT_DIR=${LATENT_DIR:-/data/vae_latents}
 LMDB_DIR=${LMDB_DIR:-/data/lmdb_shards}
 
@@ -45,15 +44,13 @@ case "${STEP}" in
     echo "=== Step 0a: Encode videos → VAE latents ==="
     ${TORCHRUN} scripts/distill/compute_vae_latent.py \
         --ckpt_path "${CKPT_PATH}" \
-        --input_video_folder "${VIDEO_DIR}" \
-        --prompt_folder "${PROMPT_DIR}" \
+        --json_path "${JSON_PATH}" \
         --output_latent_folder "${LATENT_DIR}"
 
     echo "=== Step 0b: Build LMDB shards ==="
     python scripts/distill/create_lmdb_shards.py \
         --data_path "${LATENT_DIR}" \
-        --prompt_path "${PROMPT_DIR}" \
-        --video_path "${VIDEO_DIR}" \
+        --json_path "${JSON_PATH}" \
         --lmdb_path "${LMDB_DIR}" \
         --num_shards 16
     echo "=== Data ready at ${LMDB_DIR} ==="
