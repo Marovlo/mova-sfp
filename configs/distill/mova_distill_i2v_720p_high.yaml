@@ -1,0 +1,68 @@
+# ============================================================
+# MOVA I2V DMD distillation — Stage 1: high_noise
+# 720p (1280×720), 81 frames
+# ============================================================
+
+# ---------- Task ----------
+i2v: true
+training_target: high_noise
+
+# ---------- Model ----------
+pretrained_path: /path/to/MOVA-720p
+boundary_step: 500              # SFP wan22 I2V uses 500 (not 900 like T2V)
+timestep_shift: 5.0
+num_train_timestep: 1000
+guidance_scale: 3.5             # matches wan22_high_i2v.yaml
+
+# ---------- Denoising schedule ----------
+denoising_step_list:
+  - 1000
+  - 750
+
+# ---------- Shape [B, F_lat, C, H_lat, W_lat] ----------
+# 720p (1280×720) → H_lat=90, W_lat=160  (stride 8)
+# 81 frames → F_lat = 21                 (stride 4 + 1)
+image_or_video_shape: [1, 21, 16, 90, 160]
+num_training_frames: 21
+num_frame_per_block: 3
+same_step_across_blocks: true
+independent_first_frame: false
+
+# ---------- Data (I2V: sharding lmdb from offline preprocessing) ----------
+data_path: /path/to/lmdb_shards
+batch_size: 1
+num_workers: 8
+
+# ---------- Optimisation ----------
+lr: 2.0e-06
+lr_critic: 4.0e-07
+beta1: 0.0
+beta2: 0.999
+beta1_critic: 0.0
+beta2_critic: 0.999
+weight_decay: 0.01
+dfake_gen_update_ratio: 5
+ema_weight: 0.99
+ema_start_step: 200
+max_grad_norm_generator: 10.0
+max_grad_norm_critic: 10.0
+
+# ---------- FSDP ----------
+sharding_strategy: full
+fsdp_wrap_strategy: size        # "size" or "transformer"
+text_encoder_cpu_offload: true
+gradient_checkpointing: true
+gradient_checkpointing_offload: false
+mixed_precision: true
+
+# ---------- Training ----------
+max_steps: 2000
+log_iters: 200
+gc_interval: 100
+no_save: false
+logdir: logs/mova_distill_i2v_720p_high
+seed: 0
+
+# ---------- Misc ----------
+negative_prompt: "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
+disable_wandb: true
