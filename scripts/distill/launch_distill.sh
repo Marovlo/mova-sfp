@@ -12,6 +12,9 @@
 # Step 2: Low-noise distillation (needs step 1 checkpoint)
 #   bash scripts/distill/launch_distill.sh low
 #
+# Single-GPU: set NPROC_PER_NODE=1
+#   NPROC_PER_NODE=1 bash scripts/distill/launch_distill.sh high
+#
 # Multi-node: set NNODES, NODE_RANK, MASTER_ADDR, MASTER_PORT before running.
 # ============================================================
 
@@ -20,6 +23,11 @@ set -e
 NNODES=${NNODES:-1}
 NODE_RANK=${NODE_RANK:-0}
 NPROC=${NPROC_PER_NODE:-8}
+
+if [ "${NPROC}" = "1" ]; then
+    echo "[single-gpu] nproc_per_node=1, running single-GPU mode"
+fi
+
 MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 MASTER_PORT=${MASTER_PORT:-29500}
 RDZV_ID=${RDZV_ID:-mova_distill}
