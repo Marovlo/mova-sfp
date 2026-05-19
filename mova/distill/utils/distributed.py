@@ -62,6 +62,9 @@ def fsdp_wrap(
     cpu_offload: bool = False,
     ignored_modules=None,
 ):
+    if dist.get_world_size() <= 1:
+        return module
+
     if mixed_precision:
         mp = MixedPrecision(
             param_dtype=torch.bfloat16,
@@ -103,6 +106,8 @@ def fsdp_wrap(
 
 
 def fsdp_state_dict(model):
+    if not isinstance(model, FSDP):
+        return {k: v.clone().cpu() for k, v in model.state_dict().items()}
     cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
     with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, cfg):
         return model.state_dict()
@@ -126,6 +131,26 @@ class EMA_FSDP:
             for n, p in fsdp_module.module.named_parameters():
                 if n in self.shadow:
                     self.shadow[n].mul_(self.decay).add_(p.detach().float().cpu(), alpha=1.0 - self.decay)
+
+    def state_dict(self):
+        return self.shadow
+
+    def load_state_dict(self, sd):
+        self.shadow = {k: v.clone() for k, v in sd.items()}
+
+
+class EMA:
+    def __init__(self, module, decay: float = 0.999):
+        self.decay = decay
+        self.shadow = {}
+        for n, p in module.named_parameters():
+            self.shadow[n] = p.detach().clone().float().cpu()
+
+    @torch.no_grad()
+    def update(self, module):
+        for n, p in module.named_parameters():
+            if n in self.shadow:
+                self.shadow[n].mul_(self.decay).add_(p.detach().float().cpu(), alpha=1.0 - self.decay)
 
     def state_dict(self):
         return self.shadow

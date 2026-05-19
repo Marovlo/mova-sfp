@@ -30,7 +30,7 @@ from mova.distill.model.builder import build_distill_modules
 from mova.distill.model.dmd import MOVADMD
 from mova.distill.model.mova_dit_wrapper import MOVAVideoDiTWrapper
 from mova.distill.utils.distributed import (
-    EMA_FSDP, fsdp_state_dict, fsdp_wrap, launch_distributed_job,
+    EMA, EMA_FSDP, fsdp_state_dict, fsdp_wrap, launch_distributed_job,
 )
 
 
@@ -220,12 +220,19 @@ class DistillationTrainer:
             ds = DATASETS.build(ds_cfg)
             collate = text_collate_fn
 
-        sampler = torch_dist_data.DistributedSampler(ds, shuffle=True, drop_last=True)
-        loader = DataLoader(
-            ds, batch_size=cfg.batch_size, sampler=sampler,
-            num_workers=getattr(cfg, "num_workers", 8),
-            collate_fn=collate, pin_memory=True,
-        )
+        if self.world_size > 1:
+            sampler = torch_dist_data.DistributedSampler(ds, shuffle=True, drop_last=True)
+            loader = DataLoader(
+                ds, batch_size=cfg.batch_size, sampler=sampler,
+                num_workers=getattr(cfg, "num_workers", 8),
+                collate_fn=collate, pin_memory=True,
+            )
+        else:
+            loader = DataLoader(
+                ds, batch_size=cfg.batch_size, shuffle=True, drop_last=True,
+                num_workers=getattr(cfg, "num_workers", 8),
+                collate_fn=collate, pin_memory=True,
+            )
         if self.is_main:
             print(f"[Distill] Dataset size: {len(ds)}")
         self.dataloader = _cycle(loader)
@@ -360,7 +367,11 @@ class DistillationTrainer:
             loss.backward()
             active = self.model.generator.video_dit_high if cfg.training_target == "high_noise" \
                 else self.model.generator.video_dit_low
-            grad_norm = active.clip_grad_norm_(self.max_grad_norm_generator)
+            if hasattr(active, "clip_grad_norm_"):
+                grad_norm = active.clip_grad_norm_(self.max_grad_norm_generator)
+            else:
+                raw_norm = torch.nn.utils.clip_grad_norm_(active.parameters(), self.max_grad_norm_generator)
+                grad_norm = torch.tensor(raw_norm)
             log.update({"generator_loss": loss.detach(), "generator_grad_norm": grad_norm.detach()})
             return log
 
@@ -372,7 +383,11 @@ class DistillationTrainer:
         loss.backward()
         active = self.model.fake_score.video_dit_high if cfg.training_target == "high_noise" \
             else self.model.fake_score.video_dit_low
-        grad_norm = active.clip_grad_norm_(self.max_grad_norm_critic)
+        if hasattr(active, "clip_grad_norm_"):
+            grad_norm = active.clip_grad_norm_(self.max_grad_norm_critic)
+        else:
+            raw_norm = torch.nn.utils.clip_grad_norm_(active.parameters(), self.max_grad_norm_critic)
+            grad_norm = torch.tensor(raw_norm)
         log.update({"critic_loss": loss.detach(), "critic_grad_norm": grad_norm.detach()})
         return log
 
@@ -419,7 +434,7 @@ class DistillationTrainer:
                 if self.generator_ema is None and self.ema_weight > 0 and self.step >= self.ema_start_step:
                     active = self.model.generator.video_dit_high if cfg.training_target == "high_noise" \
                         else self.model.generator.video_dit_low
-                    self.generator_ema = EMA_FSDP(active, decay=self.ema_weight)
+                    self.generator_ema = (EMA_FSDP if self.world_size > 1 else EMA)(active, decay=self.ema_weight)
                 elif self.generator_ema is not None:
                     active = self.model.generator.video_dit_high if cfg.training_target == "high_noise" \
                         else self.model.generator.video_dit_low
