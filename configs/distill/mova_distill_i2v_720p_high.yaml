@@ -52,7 +52,7 @@ sharding_strategy: full
 fsdp_wrap_strategy: size        # "size" or "transformer"
 text_encoder_cpu_offload: true
 gradient_checkpointing: true
-gradient_checkpointing_offload: false
+gradient_checkpointing_offload: true
 mixed_precision: true
 
 # ---------- Training ----------

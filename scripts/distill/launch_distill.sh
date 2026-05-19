@@ -18,11 +18,15 @@
 # Multi-node: set NNODES, NODE_RANK, MASTER_ADDR, MASTER_PORT before running.
 # ============================================================
 
+export IMAGEIO_VIDEO_BACKEND=ffmpeg
+export IMAGEIO_VideoReader=ffmpeg
+export PYTHONPATH="/path/to/mova-sfp:$PYTHONPATH"
+
 set -e
 
 NNODES=${NNODES:-1}
 NODE_RANK=${NODE_RANK:-0}
-NPROC=${NPROC_PER_NODE:-8}
+NPROC=${NPROC_PER_NODE:-1}
 
 if [ "${NPROC}" = "1" ]; then
     echo "[single-gpu] nproc_per_node=1, running single-GPU mode"
@@ -36,8 +40,16 @@ CKPT_PATH=${CKPT_PATH:-/path/to/MOVA-720p}
 JSON_PATH=${JSON_PATH:-/data/train_data.json}
 LATENT_DIR=${LATENT_DIR:-/data/vae_latents}
 LMDB_DIR=${LMDB_DIR:-/data/lmdb_shards}
-
+HIGH_LOG_DIR=${HIGH_LOG_DIR:-/path/to/logs/mova_distill_i2v_720p_high}
+LOW_LOG_DIR=${LOW_LOG_DIR:-/path/to/logs/mova_distill_i2v_720p_low}
 STEP=${1:?"Usage: $0 {data|high|low}"}
+
+# ===================== 统一视频尺寸参数 =====================
+TARGET_H=480
+TARGET_W=832
+TARGET_FRAMES=49
+MIN_PROMPT_LEN=100
+# ============================================================
 
 TORCHRUN="torchrun \
     --nnodes=${NNODES} \
@@ -53,29 +65,39 @@ case "${STEP}" in
     ${TORCHRUN} scripts/distill/compute_vae_latent.py \
         --ckpt_path "${CKPT_PATH}" \
         --json_path "${JSON_PATH}" \
-        --output_latent_folder "${LATENT_DIR}"
+        --output_latent_folder "${LATENT_DIR}" \
+        --target_h ${TARGET_H} \
+        --target_w ${TARGET_W} \
+        --target_frames ${TARGET_FRAMES}
 
     echo "=== Step 0b: Build LMDB shards ==="
     python scripts/distill/create_lmdb_shards.py \
         --data_path "${LATENT_DIR}" \
         --json_path "${JSON_PATH}" \
         --lmdb_path "${LMDB_DIR}" \
-        --num_shards 16
+        --num_shards 16 \
+        --target_h ${TARGET_H} \
+        --target_w ${TARGET_W} \
+        --min_prompt_len ${MIN_PROMPT_LEN}
     echo "=== Data ready at ${LMDB_DIR} ==="
     ;;
-
   high)
     echo "=== Step 1: High-noise distillation ==="
     ${TORCHRUN} scripts/distill/train_distill.py \
         --config_path configs/distill/mova_distill_i2v_720p_high.yaml \
-        --disable-wandb
+        --disable-wandb \
+        --cfg data_path=${LMDB_DIR} \
+        --cfg logdir=${HIGH_LOG_DIR}
     ;;
 
   low)
     echo "=== Step 2: Low-noise distillation ==="
     ${TORCHRUN} scripts/distill/train_distill.py \
         --config_path configs/distill/mova_distill_i2v_720p_low.yaml \
-        --disable-wandb
+        --disable-wandb \
+        --cfg data_path=${LMDB_DIR} \
+        --cfg high_noise_distill_ckpt=${HIGH_LOG_DIR} \
+        --cfg logdir=${LOW_LOG_DIR}
     ;;
 
   *)

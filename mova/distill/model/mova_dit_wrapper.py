@@ -179,6 +179,11 @@ class MOVAVideoDiTWrapper(nn.Module):
         active_low = self.video_dit_low
         active_visual_dit = active_high if self.target == "high_noise" else active_low
 
+        data_device = visual_bcfhw.device
+        active_visual_dit = active_visual_dit.to(data_device)
+        if hasattr(self, 'audio_dit') and self.audio_dit is not None:
+            self.audio_dit = self.audio_dit.to(data_device)
+
         # Swap the master's video DiT references so that inference_single_step
         # uses *our* DiTs. We restore on exit (also on exception).
         prev_high, prev_low = swap_video_dit(pipe, high=active_high, low=active_low)
