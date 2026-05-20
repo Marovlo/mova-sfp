@@ -72,6 +72,7 @@ class DistillationTrainer:
         self.disable_wandb = getattr(config, "disable_wandb", True)
 
         # ---------- build distill modules ----------
+        print(f"[Distill] device={self.device}")
         if self.is_main:
             print(f"[Distill] stage={config.training_target}, i2v={self.i2v}")
             print(f"[Distill] Building modules from {config.pretrained_path}")
@@ -132,6 +133,13 @@ class DistillationTrainer:
         for p in real_score.parameters():
             p.requires_grad_(False)
 
+        print("=" * 50)
+        print("[distillation_trainer]  real_score before FSDP wrap time_embedding 层结构:", real_score.video_dit_high.time_embedding)
+        print("[distillation_trainer]  real_score  before FSDP wrap time_embedding 权重形状:", real_score.video_dit_high.time_embedding[0].weight.shape)
+        print("[distillation_trainer]  real_score  before FSDP wrap time_embedding 权重位置:", real_score.video_dit_high.time_embedding[0].weight.device)
+        print("[distillation_trainer]  real_score  before FSDP wrap time_embedding 权重维度:", real_score.video_dit_high.time_embedding[0].weight.dim())
+        print("=" * 50)
+
         # -- FSDP wrap --
         wrap_kw = dict(
             sharding_strategy=cfg.sharding_strategy,
@@ -148,6 +156,13 @@ class DistillationTrainer:
             high_noise_teacher.video_dit_high = fsdp_wrap(
                 high_noise_teacher.video_dit_high, cpu_offload=False, **wrap_kw,
             )
+        
+        print("=" * 50)
+        print("[distillation_trainer]  real_score after FSDP wrap time_embedding 层结构:", real_score.video_dit_high.time_embedding)
+        print("[distillation_trainer]  real_score  after FSDP wrap time_embedding 权重形状:", real_score.video_dit_high.time_embedding[0].weight.shape)
+        print("[distillation_trainer]  real_score  before FSDP wrap time_embedding 权重位置:", real_score.video_dit_high.time_embedding[0].weight.device)
+        print("[distillation_trainer]  real_score  after FSDP wrap time_embedding 权重维度:", real_score.video_dit_high.time_embedding[0].weight.dim())
+        print("=" * 50)
 
         # -- peripherals placement --
         text_offload = getattr(cfg, "text_encoder_cpu_offload", True)
@@ -234,7 +249,7 @@ class DistillationTrainer:
                 collate_fn=collate, pin_memory=True,
             )
         if self.is_main:
-            print(f"[Distill] Dataset size: {len(ds)}")
+            print(f"[Distill] Building ShardingLMDBDataset: {cfg.data_path} Dataset size: {len(ds)}")
         self.dataloader = _cycle(loader)
 
     # ============================================================

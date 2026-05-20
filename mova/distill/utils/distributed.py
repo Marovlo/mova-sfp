@@ -65,6 +65,20 @@ def fsdp_wrap(
     if dist.get_world_size() <= 1:
         return module
 
+    ignored_modules = []
+    for name, sub_mod in module.named_modules():
+        if any(key in name for key in [
+            "time_embedding",
+            "time_projection",
+            "text_embedding",
+            "patch_embedding",
+            "head",
+            "img_emb",
+            "ref_conv",
+        ]):
+            ignored_modules.append(sub_mod)
+
+    # ===================== 混合精度 =====================
     if mixed_precision:
         mp = MixedPrecision(
             param_dtype=torch.bfloat16,
@@ -75,15 +89,22 @@ def fsdp_wrap(
     else:
         mp = None
 
+    # ===================== 包装策略（fixed partial）=====================
     if wrap_strategy == "transformer":
-        assert transformer_module is not None, "transformer wrap needs `transformer_module`"
-        policy = partial(transformer_auto_wrap_policy, transformer_layer_cls=transformer_module)
+        assert transformer_module is not None
+        policy = partial(
+            transformer_auto_wrap_policy,
+            transformer_layer_cls=transformer_module
+        )
     elif wrap_strategy == "size":
-        policy = partial(size_based_auto_wrap_policy, min_num_params=min_num_params)
+        policy = partial(
+            size_based_auto_wrap_policy,
+            min_num_params=min_num_params
+        )
     else:
         raise ValueError(f"Unknown wrap_strategy: {wrap_strategy}")
 
-    os.environ.setdefault("NCCL_CROSS_NIC", "1")
+    # ===================== 策略映射 =====================
     strategy = {
         "full": ShardingStrategy.FULL_SHARD,
         "hybrid_full": ShardingStrategy.HYBRID_SHARD,
@@ -91,7 +112,8 @@ def fsdp_wrap(
         "no_shard": ShardingStrategy.NO_SHARD,
     }[sharding_strategy]
 
-    return FSDP(
+    # 构建 FSDP
+    fsdp_model = FSDP(
         module,
         auto_wrap_policy=policy,
         sharding_strategy=strategy,
@@ -101,9 +123,14 @@ def fsdp_wrap(
         use_orig_params=True,
         ignored_modules=ignored_modules,
         cpu_offload=CPUOffload(offload_params=cpu_offload),
-        sync_module_states=False,
+        sync_module_states=True,
     )
 
+    device = torch.cuda.current_device()
+    for m in ignored_modules:
+        m.to(device)
+
+    return fsdp_model
 
 def fsdp_state_dict(model):
     if not isinstance(model, FSDP):

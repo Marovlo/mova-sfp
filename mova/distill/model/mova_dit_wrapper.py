@@ -146,6 +146,17 @@ class MOVAVideoDiTWrapper(nn.Module):
         # SFP layout [B, F, C, H, W] → MOVA layout [B, C, F, H, W]
         visual_bcfhw = noisy_image_or_video.permute(0, 2, 1, 3, 4).contiguous()
 
+        # I2V: the noisy input has F-1 frames (first frame is clean, provided by
+        # initial_latent). MOVA's inference_single_step expects visual_latents to
+        # have the FULL F frames (it concats with y on channel dim, requiring
+        # matching temporal dim). So we prepend initial_latent to restore F frames.
+        initial_latent = conditional_dict.get("initial_latent", None)
+        if initial_latent is not None:
+            # initial_latent: [B, 1, C, H, W] (SFP layout) → [B, C, 1, H, W] (MOVA layout)
+            first_frame_bcfhw = initial_latent.permute(0, 2, 1, 3, 4).contiguous().to(
+                device=visual_bcfhw.device, dtype=visual_bcfhw.dtype)
+            visual_bcfhw = torch.cat([first_frame_bcfhw, visual_bcfhw], dim=2)  # [B, C, F, H, W]
+
         # First-frame condition. The pipeline's inference_single_step expects a
         # tensor `y` with 20 channels (4 mask + 16 vae) when require_vae_embedding.
         if y is None:
@@ -178,15 +189,22 @@ class MOVAVideoDiTWrapper(nn.Module):
         active_high = self.video_dit_high
         active_low = self.video_dit_low
         active_visual_dit = active_high if self.target == "high_noise" else active_low
-
-        data_device = visual_bcfhw.device
-        active_visual_dit = active_visual_dit.to(data_device)
-        if hasattr(self, 'audio_dit') and self.audio_dit is not None:
-            self.audio_dit = self.audio_dit.to(data_device)
+        print("=" * 50)
+        print("[mova_dit_wrapper]  active_visual_dit time_embedding 层结构:", active_visual_dit.time_embedding)
+        print("[mova_dit_wrapper]  active_visual_dit time_embedding 权重形状:", active_visual_dit.time_embedding[0].weight.shape)
+        print("[mova_dit_wrapper]  active_visual_dit time_embedding 权重维度:", active_visual_dit.time_embedding[0].weight.dim())
+        print("=" * 50)
 
         # Swap the master's video DiT references so that inference_single_step
         # uses *our* DiTs. We restore on exit (also on exception).
-        prev_high, prev_low = swap_video_dit(pipe, high=active_high, low=active_low)
+        prev_high_forward, prev_low_forward = swap_video_dit(pipe, high=active_high, low=active_low)
+
+        print("=" * 50)
+        print("[mova_dit_wrapper]  active_visual_dit after swap time_embedding 层结构:", active_visual_dit.time_embedding)
+        print("[mova_dit_wrapper]  active_visual_dit after swap time_embedding 权重形状:", active_visual_dit.time_embedding[0].weight.shape)
+        print("[mova_dit_wrapper]  active_visual_dit after swap time_embedding 权重维度:", active_visual_dit.time_embedding[0].weight.dim())
+        print("=" * 50)
+
         try:
             flow_pred_bcfhw, _audio_pred = pipe.inference_single_step(
                 visual_dit=active_visual_dit,
@@ -200,10 +218,17 @@ class MOVAVideoDiTWrapper(nn.Module):
                 cp_mesh=cp_mesh,
             )
         finally:
-            swap_video_dit(pipe, high=prev_high, low=prev_low)
+            self.video_dit_high.forward = prev_high_forward
+            self.video_dit_low.forward = prev_low_forward
 
         # MOVA layout → SFP layout
         flow_pred = flow_pred_bcfhw.permute(0, 2, 1, 3, 4).contiguous()
+
+        # I2V: we prepended initial_latent, so the output has F frames but
+        # the caller expects F-1 frames (matching the input noisy). Strip the
+        # first-frame prediction (it's trivial / clean and not used by DMD).
+        if initial_latent is not None:
+            flow_pred = flow_pred[:, 1:, ...]
 
         if self.target == "high_noise":
             x_pred = self._convert_flow_pred_to_x_bound(

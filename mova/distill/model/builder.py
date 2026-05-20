@@ -125,13 +125,18 @@ def build_distill_modules(
 
 
 def swap_video_dit(pipeline: MOVATrain, *, high: nn.Module, low: nn.Module):
-    """Temporarily swap the video DiT modules of a master pipeline. Returns the
-    previous (high, low) so the caller can restore them.
+    """
+    🔥 FSDP / DDP 唯一安全版本
+    只劫持 forward，不替换 module
+    权重永远保持正常形状，不会变成 1D / size [0]
+    """
+    # 保存原来的 forward
+    orig_high_forward = pipeline.video_dit.forward
+    orig_low_forward = pipeline.video_dit_2.forward
 
-    This is used by the wrapper to route forward through a specific role's DiT
-    while keeping the rest of MOVATrain.inference_single_step's flow intact."""
-    prev_high = pipeline.video_dit
-    prev_low = pipeline.video_dit_2
-    pipeline.video_dit = high
-    pipeline.video_dit_2 = low
-    return prev_high, prev_low
+    # 只替换 forward 方法！！！不碰模型本身！！！
+    pipeline.video_dit.forward = high.forward
+    pipeline.video_dit_2.forward = low.forward
+
+    # 返回原始 forward，用于恢复
+    return orig_high_forward, orig_low_forward
