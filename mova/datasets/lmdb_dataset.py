@@ -33,6 +33,7 @@ class ShardingLMDBDataset(Dataset):
     def __init__(self, data_path: str, max_pair: int = int(1e8), transform=None):
         self.envs = []
         self.index = []  # list of (shard_id, local_idx)
+        self.img_shapes = []
         self.latents_shape = []
         self.transform = transform
 
@@ -43,8 +44,12 @@ class ShardingLMDBDataset(Dataset):
             env = lmdb.open(path, readonly=True, lock=False, readahead=False, meminit=False)
             shard_id = len(self.envs)
             self.envs.append(env)
+
             shape = get_array_shape_from_lmdb(env, "latents")
             self.latents_shape.append(shape)
+            img_shape = get_array_shape_from_lmdb(env, "img")
+            self.img_shapes.append(img_shape)
+
             for local_i in range(shape[0]):
                 self.index.append((shard_id, local_i))
 
@@ -57,6 +62,8 @@ class ShardingLMDBDataset(Dataset):
         shard_id, local_idx = self.index[idx]
         env = self.envs[shard_id]
         shape = self.latents_shape[shard_id]
+        img_shape = self.img_shapes[shard_id]
+        # print(f"[ShardingLMDBDataset] latent:{shape} img:{img_shape}")
 
         latents = retrieve_row_from_lmdb(env, "latents", np.float16, local_idx, shape=shape[1:])
         if len(latents.shape) == 4:
@@ -66,12 +73,13 @@ class ShardingLMDBDataset(Dataset):
 
         # First-frame RGB (480×832×3 uint8 → tensor [-1,1])
         try:
-            img_np = retrieve_row_from_lmdb(env, "img", np.uint8, local_idx, shape=(480, 832, 3))
+            img_np = retrieve_row_from_lmdb(env, "img", np.uint8, local_idx, shape=img_shape[1:])
             img = Image.fromarray(img_np)
             img = TF.to_tensor(img).sub_(0.5).div_(0.5)  # [C, H, W] in [-1,1]
         except KeyError:
             # Fallback: no img stored (pure T2V lmdb). Return zero tensor.
-            img = torch.zeros(3, 480, 832)
+            _, h, w, c = img_shape 
+            img = torch.zeros(c, h, w)
 
         return {
             "prompts": prompt,

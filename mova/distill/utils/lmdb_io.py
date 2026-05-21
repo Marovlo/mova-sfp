@@ -44,8 +44,7 @@ def process_data_dict(data_dict: dict, seen_prompts: set):
         if prompt in seen_prompts:
             continue
         seen_prompts.add(prompt)
-        video_np = video.half().numpy()
-        all_videos.append(video_np)
+        all_videos.append(video.half().numpy())
         all_prompts.append(prompt)
     if not all_videos:
         return {"latents": np.array([]), "prompts": np.array([])}
