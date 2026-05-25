@@ -147,10 +147,17 @@ class DistillationTrainer:
             wrap_strategy=cfg.fsdp_wrap_strategy,
             transformer_module={WanDiTBlock} if cfg.fsdp_wrap_strategy == "transformer" else None,
         )
-        for wrapper in (generator, real_score, fake_score):
-            wrapper.video_dit_high = fsdp_wrap(wrapper.video_dit_high, **wrap_kw)
-            wrapper.video_dit_low = fsdp_wrap(wrapper.video_dit_low, **wrap_kw)
-            wrapper.model = wrapper.video_dit_high if target == "high_noise" else wrapper.video_dit_low
+        generator.video_dit_high = fsdp_wrap(generator.video_dit_high, cpu_offload=True, **wrap_kw)
+        generator.video_dit_low = fsdp_wrap(generator.video_dit_low, cpu_offload=True, **wrap_kw)
+        generator.model = generator.video_dit_high if target == "high_noise" else generator.video_dit_low
+
+        fake_score.video_dit_high = fsdp_wrap(fake_score.video_dit_high, **wrap_kw)
+        fake_score.video_dit_low = fsdp_wrap(fake_score.video_dit_low, **wrap_kw)
+        fake_score.model = fake_score.video_dit_high if target == "high_noise" else fake_score.video_dit_low
+
+        real_score.video_dit_high = fsdp_wrap(real_score.video_dit_high, cpu_offload=True, **wrap_kw)
+        real_score.video_dit_low = fsdp_wrap(real_score.video_dit_low, cpu_offload=True, **wrap_kw)
+        real_score.model = real_score.video_dit_high if target == "high_noise" else real_score.video_dit_low
 
         if high_noise_teacher is not None:
             high_noise_teacher.video_dit_high = fsdp_wrap(
@@ -378,6 +385,7 @@ class DistillationTrainer:
                 conditional_dict=cond, unconditional_dict=uncond,
                 initial_latent=initial_latent, y=y,
             )
+            torch.cuda.synchronize()
             torch.cuda.empty_cache()
             loss.backward()
             active = self.model.generator.video_dit_high if cfg.training_target == "high_noise" \
@@ -389,22 +397,24 @@ class DistillationTrainer:
                 grad_norm = torch.tensor(raw_norm)
             log.update({"generator_loss": loss.detach(), "generator_grad_norm": grad_norm.detach()})
             return log
-
-        loss, log = self.model.critic_loss(
-            image_or_video_shape=shape,
-            conditional_dict=cond, unconditional_dict=uncond,
-            initial_latent=initial_latent, y=y,
-        )
-        loss.backward()
-        active = self.model.fake_score.video_dit_high if cfg.training_target == "high_noise" \
-            else self.model.fake_score.video_dit_low
-        if hasattr(active, "clip_grad_norm_"):
-            grad_norm = active.clip_grad_norm_(self.max_grad_norm_critic)
         else:
-            raw_norm = torch.nn.utils.clip_grad_norm_(active.parameters(), self.max_grad_norm_critic)
-            grad_norm = torch.tensor(raw_norm)
-        log.update({"critic_loss": loss.detach(), "critic_grad_norm": grad_norm.detach()})
-        return log
+            loss, log = self.model.critic_loss(
+                image_or_video_shape=shape,
+                conditional_dict=cond, unconditional_dict=uncond,
+                initial_latent=initial_latent, y=y,
+            )
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            loss.backward()
+            active = self.model.fake_score.video_dit_high if cfg.training_target == "high_noise" \
+                else self.model.fake_score.video_dit_low
+            if hasattr(active, "clip_grad_norm_"):
+                grad_norm = active.clip_grad_norm_(self.max_grad_norm_critic)
+            else:
+                raw_norm = torch.nn.utils.clip_grad_norm_(active.parameters(), self.max_grad_norm_critic)
+                grad_norm = torch.tensor(raw_norm)
+            log.update({"critic_loss": loss.detach(), "critic_grad_norm": grad_norm.detach()})
+            return log
 
     # ============================================================
     # Save
