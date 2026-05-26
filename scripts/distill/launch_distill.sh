@@ -82,6 +82,7 @@ case "${STEP}" in
     echo "=== Data ready at ${LMDB_DIR} ==="
     ;;
   high)
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
     echo "=== Step 1: High-noise distillation ==="
     ${TORCHRUN} scripts/distill/train_distill.py \
         --config_path configs/distill/mova_distill_i2v_720p_high.yaml \
@@ -91,6 +92,7 @@ case "${STEP}" in
     ;;
 
   low)
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
     echo "=== Step 2: Low-noise distillation ==="
     ${TORCHRUN} scripts/distill/train_distill.py \
         --config_path configs/distill/mova_distill_i2v_720p_low.yaml \

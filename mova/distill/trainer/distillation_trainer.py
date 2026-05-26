@@ -184,8 +184,17 @@ class DistillationTrainer:
         self.master.audio_vae.to("cpu")
         self.master.audio_vae.requires_grad_(False)
         self.master.audio_dit.to(self.device, dtype=self.dtype)
-        self.master.audio_dit.requires_grad_(False)
         self.master.dual_tower_bridge.to(self.device, dtype=self.dtype)
+
+        audio_dit_offload = getattr(cfg, "audio_dit_cpu_offload", True)
+        bridge_offload = getattr(cfg, "dual_tower_bridge_cpu_offload", True)
+        self._audio_dit_offload = audio_dit_offload
+        self._bridge_offload = bridge_offload
+        if audio_dit_offload:
+            self.master.audio_dit.to("cpu")
+        if bridge_offload:
+            self.master.dual_tower_bridge.to("cpu")
+        self.master.audio_dit.requires_grad_(False)
         self.master.dual_tower_bridge.requires_grad_(False)
 
         # -- DMD model --
@@ -379,6 +388,11 @@ class DistillationTrainer:
             if cfg.training_target == "low_noise":
                 self._maybe_build_x_bound(batch_size, cond, y=y)
 
+        if self._audio_dit_offload:
+            self.master.audio_dit.to(self.device)
+        if self._bridge_offload:
+            self.master.dual_tower_bridge.to(self.device)
+
         if train_generator:
             loss, log = self.model.generator_loss(
                 image_or_video_shape=shape,
@@ -395,6 +409,12 @@ class DistillationTrainer:
             else:
                 raw_norm = torch.nn.utils.clip_grad_norm_(active.parameters(), self.max_grad_norm_generator)
                 grad_norm = torch.tensor(raw_norm)
+
+            if self._audio_dit_offload:
+                self.master.audio_dit.to("cpu")
+            if self._bridge_offload:
+                self.master.dual_tower_bridge.to("cpu")
+
             log.update({"generator_loss": loss.detach(), "generator_grad_norm": grad_norm.detach()})
             return log
         else:
@@ -413,6 +433,12 @@ class DistillationTrainer:
             else:
                 raw_norm = torch.nn.utils.clip_grad_norm_(active.parameters(), self.max_grad_norm_critic)
                 grad_norm = torch.tensor(raw_norm)
+
+            if self._audio_dit_offload:
+                self.master.audio_dit.to("cpu")
+            if self._bridge_offload:
+                self.master.dual_tower_bridge.to("cpu")
+
             log.update({"critic_loss": loss.detach(), "critic_grad_norm": grad_norm.detach()})
             return log
 

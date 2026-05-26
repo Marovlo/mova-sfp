@@ -121,6 +121,8 @@ def fsdp_wrap(
         device_id=torch.cuda.current_device(),
         limit_all_gathers=True,
         use_orig_params=True,
+        forward_prefetch=False,
+        reshard_after_forward=True,
         ignored_modules=ignored_modules,
         cpu_offload=CPUOffload(offload_params=cpu_offload),
         sync_module_states=True,
