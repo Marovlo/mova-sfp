@@ -52,6 +52,50 @@ def launch_distributed_job(backend: str = "nccl"):
     torch.cuda.set_device(local_rank)
 
 
+def build_device_mesh(dp_size: int = 1, cp_size: int = 1):
+    """Build a 2D or 3D DeviceMesh for (dp, [cp,] fsdp) parallelism.
+
+    Args:
+        dp_size: number of data-parallel replicas.
+        cp_size: number of context-parallel (sequence-parallel) ranks.
+                 Set to 1 to disable CP.
+
+    Returns:
+        mesh: DeviceMesh with dimensions named ("dp", "cp", "fsdp") if cp_size>1,
+              or ("dp", "fsdp") if cp_size==1.
+        dp_size, cp_size, fsdp_size: the actual sizes used.
+
+    The product dp_size * cp_size * fsdp_size must equal world_size.
+    """
+    from torch.distributed.device_mesh import init_device_mesh
+
+    world_size = dist.get_world_size()
+    fsdp_size = world_size // (dp_size * cp_size)
+    assert dp_size * cp_size * fsdp_size == world_size, (
+        f"dp_size({dp_size}) * cp_size({cp_size}) * fsdp_size({fsdp_size}) "
+        f"!= world_size({world_size})"
+    )
+
+    if cp_size > 1:
+        mesh = init_device_mesh(
+            "cuda",
+            (dp_size, cp_size, fsdp_size),
+            mesh_dim_names=("dp", "cp", "fsdp"),
+        )
+    else:
+        mesh = init_device_mesh(
+            "cuda",
+            (dp_size, fsdp_size),
+            mesh_dim_names=("dp", "fsdp"),
+        )
+
+    if dist.get_rank() == 0:
+        print(f"[DeviceMesh] dp={dp_size}, cp={cp_size}, fsdp={fsdp_size}, "
+              f"world={world_size}")
+
+    return mesh, dp_size, cp_size, fsdp_size
+
+
 def fsdp_wrap(
     module,
     sharding_strategy: str = "full",
@@ -61,6 +105,7 @@ def fsdp_wrap(
     transformer_module=None,
     cpu_offload: bool = False,
     ignored_modules=None,
+    device_mesh=None,
 ):
     if dist.get_world_size() <= 1:
         return module
@@ -78,7 +123,6 @@ def fsdp_wrap(
         ]):
             ignored_modules.append(sub_mod)
 
-    # ===================== 混合精度 =====================
     if mixed_precision:
         mp = MixedPrecision(
             param_dtype=torch.bfloat16,
@@ -89,7 +133,6 @@ def fsdp_wrap(
     else:
         mp = None
 
-    # ===================== 包装策略（fixed partial）=====================
     if wrap_strategy == "transformer":
         assert transformer_module is not None
         policy = partial(
@@ -104,7 +147,6 @@ def fsdp_wrap(
     else:
         raise ValueError(f"Unknown wrap_strategy: {wrap_strategy}")
 
-    # ===================== 策略映射 =====================
     strategy = {
         "full": ShardingStrategy.FULL_SHARD,
         "hybrid_full": ShardingStrategy.HYBRID_SHARD,
@@ -112,7 +154,14 @@ def fsdp_wrap(
         "no_shard": ShardingStrategy.NO_SHARD,
     }[sharding_strategy]
 
-    # 构建 FSDP
+    # If a DeviceMesh is provided, extract the "fsdp" sub-mesh as the
+    # process group so that FSDP only shards across the fsdp dimension
+    # (not across dp or cp ranks).
+    fsdp_kwargs = {}
+    if device_mesh is not None:
+        fsdp_mesh = device_mesh["fsdp"]
+        fsdp_kwargs["process_group"] = fsdp_mesh.get_group()
+
     fsdp_model = FSDP(
         module,
         auto_wrap_policy=policy,
@@ -126,6 +175,7 @@ def fsdp_wrap(
         ignored_modules=ignored_modules,
         cpu_offload=CPUOffload(offload_params=cpu_offload),
         sync_module_states=True,
+        **fsdp_kwargs,
     )
 
     device = torch.cuda.current_device()

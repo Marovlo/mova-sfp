@@ -31,6 +31,7 @@ from mova.distill.model.dmd import MOVADMD
 from mova.distill.model.mova_dit_wrapper import MOVAVideoDiTWrapper
 from mova.distill.utils.distributed import (
     EMA, EMA_FSDP, fsdp_state_dict, fsdp_wrap, launch_distributed_job,
+    build_device_mesh,
 )
 
 
@@ -71,7 +72,37 @@ class DistillationTrainer:
         self.i2v = getattr(config, "i2v", False)
         self.disable_wandb = getattr(config, "disable_wandb", True)
 
+        # ---------- device mesh (dp / cp / fsdp) ----------
+        dp_size = getattr(config, "dp_size", 1)
+        cp_size = getattr(config, "cp_size", 1)
+        if self.world_size > 1 and (dp_size > 1 or cp_size > 1):
+            self.mesh, self._dp_size, self._cp_size, self._fsdp_size = \
+                build_device_mesh(dp_size=dp_size, cp_size=cp_size)
+            self.cp_mesh = self.mesh["cp"] if cp_size > 1 else None
+        else:
+            self.mesh = None
+            self._dp_size = 1
+            self._cp_size = 1
+            self._fsdp_size = self.world_size
+            self.cp_mesh = None
+
         # ---------- build distill modules ----------
+        # Setup Context Parallel (yunchang) if cp_size > 1
+        if self.cp_mesh is not None:
+            from yunchang import set_seq_parallel_pg
+            cp_sz = self._cp_size
+            MAX_ULYSSES = 4
+            sp_ulysses = min(MAX_ULYSSES, cp_sz)
+            sp_ring = cp_sz // sp_ulysses
+            assert sp_ring * sp_ulysses == cp_sz
+            set_seq_parallel_pg(
+                sp_ulysses, sp_ring,
+                dist.get_rank(), dist.get_world_size(),
+                use_ulysses_low=True,
+            )
+            if self.is_main:
+                print(f"[CP] ulysses={sp_ulysses}, ring={sp_ring}")
+
         print(f"[Distill] device={self.device}")
         if self.is_main:
             print(f"[Distill] stage={config.training_target}, i2v={self.i2v}")
@@ -146,6 +177,7 @@ class DistillationTrainer:
             mixed_precision=cfg.mixed_precision,
             wrap_strategy=cfg.fsdp_wrap_strategy,
             transformer_module={WanDiTBlock} if cfg.fsdp_wrap_strategy == "transformer" else None,
+            device_mesh=self.mesh,
         )
         generator.video_dit_high = fsdp_wrap(generator.video_dit_high, cpu_offload=True, **wrap_kw)
         generator.video_dit_low = fsdp_wrap(generator.video_dit_low, cpu_offload=True, **wrap_kw)
@@ -252,7 +284,18 @@ class DistillationTrainer:
             collate = text_collate_fn
 
         if self.world_size > 1:
-            sampler = torch_dist_data.DistributedSampler(ds, shuffle=True, drop_last=True)
+            # When using a DeviceMesh with dp > 1, the DistributedSampler should
+            # shard data across dp ranks only (ranks within the same dp group
+            # share the same batch since they are FSDP/CP peers).
+            if self.mesh is not None and self._dp_size > 1:
+                dp_group = self.mesh["dp"].get_group()
+                dp_rank = dist.get_rank(dp_group)
+                sampler = torch_dist_data.DistributedSampler(
+                    ds, num_replicas=self._dp_size, rank=dp_rank,
+                    shuffle=True, drop_last=True,
+                )
+            else:
+                sampler = torch_dist_data.DistributedSampler(ds, shuffle=True, drop_last=True)
             loader = DataLoader(
                 ds, batch_size=cfg.batch_size, sampler=sampler,
                 num_workers=getattr(cfg, "num_workers", 8),
@@ -398,6 +441,7 @@ class DistillationTrainer:
                 image_or_video_shape=shape,
                 conditional_dict=cond, unconditional_dict=uncond,
                 initial_latent=initial_latent, y=y,
+                cp_mesh=self.cp_mesh,
             )
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
@@ -422,6 +466,7 @@ class DistillationTrainer:
                 image_or_video_shape=shape,
                 conditional_dict=cond, unconditional_dict=uncond,
                 initial_latent=initial_latent, y=y,
+                cp_mesh=self.cp_mesh,
             )
             torch.cuda.synchronize()
             torch.cuda.empty_cache()

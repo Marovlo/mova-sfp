@@ -60,6 +60,10 @@ fsdp_wrap_strategy: size
 text_encoder_cpu_offload: true
 gradient_checkpointing: true
 gradient_checkpointing_offload: false
+
+# ---------- Parallelism ----------
+dp_size: 1
+cp_size: 1
 mixed_precision: true
 
 # ---------- Training ----------

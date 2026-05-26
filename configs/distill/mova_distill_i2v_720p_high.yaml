@@ -55,6 +55,14 @@ gradient_checkpointing: true
 gradient_checkpointing_offload: true
 mixed_precision: true
 
+# ---------- Parallelism ----------
+# world_size = dp_size × cp_size × fsdp_size (fsdp_size auto-computed)
+# dp_size: data parallel replicas (different batch per dp rank)
+# cp_size: context parallel / sequence parallel (splits sequence across ranks)
+# Example: 64 GPUs with dp=2, cp=4 → fsdp=8
+dp_size: 1
+cp_size: 1
+
 # ---------- Training ----------
 max_steps: 2000
 log_iters: 200

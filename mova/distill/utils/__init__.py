@@ -1,5 +1,6 @@
 from mova.distill.utils.distributed import (  # noqa: F401
-    EMA_FSDP, fsdp_state_dict, fsdp_wrap, launch_distributed_job,
+    EMA, EMA_FSDP, fsdp_state_dict, fsdp_wrap, launch_distributed_job,
+    build_device_mesh,
 )
 from mova.distill.utils.scheduler_distill import FlowMatchSchedulerDistill  # noqa: F401
 from mova.distill.utils.lmdb_io import (  # noqa: F401
