@@ -15,9 +15,10 @@ I2V data flow:
 from __future__ import annotations
 
 import gc
-import logging
 import os
 import time
+import logging
+from tqdm import tqdm
 from typing import Optional
 
 import torch
@@ -25,10 +26,10 @@ import torch.distributed as dist
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader, distributed as torch_dist_data
 
-from mova.diffusion.models.wan_video_dit import DiTBlock as WanDiTBlock
-from mova.distill.model.builder import build_distill_modules
 from mova.distill.model.dmd import MOVADMD
+from mova.distill.model.builder import build_distill_modules
 from mova.distill.model.mova_dit_wrapper import MOVAVideoDiTWrapper
+from mova.diffusion.models.wan_video_dit import DiTBlock as WanDiTBlock
 from mova.distill.utils.distributed import (
     EMA, EMA_FSDP, fsdp_state_dict, fsdp_wrap, launch_distributed_job,
     build_device_mesh,
@@ -48,6 +49,25 @@ class DistillationTrainer:
         torchrun ... train_distill.py --config ... --stage high
         torchrun ... train_distill.py --config ... --stage low
     """
+
+    # ============================================================
+    # Device-move helper (works around FSDP .to() interception)
+    # ============================================================
+    @staticmethod
+    def _move_module_to_device(module, device):
+        """Move a non-FSDP module to ``device`` deterministically.
+
+        Under FSDP, ``module.to(device)`` may be intercepted and leave some
+        sub-module parameters on CPU.  This helper first calls ``.to()`` (which
+        moves most things) and then *explicitly* moves every parameter and
+        buffer, guaranteeing that nothing stays behind.
+        """
+        module.to(device)
+        with torch.no_grad():
+            for p in module.parameters():
+                p.data = p.data.to(device=device)
+            for b in module.buffers():
+                b.data = b.data.to(device=device)
 
     def __init__(self, config):
         self.config = config
@@ -103,7 +123,6 @@ class DistillationTrainer:
             if self.is_main:
                 print(f"[CP] ulysses={sp_ulysses}, ring={sp_ring}")
 
-        print(f"[Distill] device={self.device}")
         if self.is_main:
             print(f"[Distill] stage={config.training_target}, i2v={self.i2v}")
             print(f"[Distill] Building modules from {config.pretrained_path}")
@@ -164,13 +183,6 @@ class DistillationTrainer:
         for p in real_score.parameters():
             p.requires_grad_(False)
 
-        print("=" * 50)
-        print("[distillation_trainer]  real_score before FSDP wrap time_embedding 层结构:", real_score.video_dit_high.time_embedding)
-        print("[distillation_trainer]  real_score  before FSDP wrap time_embedding 权重形状:", real_score.video_dit_high.time_embedding[0].weight.shape)
-        print("[distillation_trainer]  real_score  before FSDP wrap time_embedding 权重位置:", real_score.video_dit_high.time_embedding[0].weight.device)
-        print("[distillation_trainer]  real_score  before FSDP wrap time_embedding 权重维度:", real_score.video_dit_high.time_embedding[0].weight.dim())
-        print("=" * 50)
-
         # -- FSDP wrap --
         wrap_kw = dict(
             sharding_strategy=cfg.sharding_strategy,
@@ -183,8 +195,8 @@ class DistillationTrainer:
         generator.video_dit_low = fsdp_wrap(generator.video_dit_low, cpu_offload=True, **wrap_kw)
         generator.model = generator.video_dit_high if target == "high_noise" else generator.video_dit_low
 
-        fake_score.video_dit_high = fsdp_wrap(fake_score.video_dit_high, **wrap_kw)
-        fake_score.video_dit_low = fsdp_wrap(fake_score.video_dit_low, **wrap_kw)
+        fake_score.video_dit_high = fsdp_wrap(fake_score.video_dit_high, cpu_offload=True, **wrap_kw)
+        fake_score.video_dit_low = fsdp_wrap(fake_score.video_dit_low, cpu_offload=True, **wrap_kw)
         fake_score.model = fake_score.video_dit_high if target == "high_noise" else fake_score.video_dit_low
 
         real_score.video_dit_high = fsdp_wrap(real_score.video_dit_high, cpu_offload=True, **wrap_kw)
@@ -195,37 +207,31 @@ class DistillationTrainer:
             high_noise_teacher.video_dit_high = fsdp_wrap(
                 high_noise_teacher.video_dit_high, cpu_offload=False, **wrap_kw,
             )
-        
-        print("=" * 50)
-        print("[distillation_trainer]  real_score after FSDP wrap time_embedding 层结构:", real_score.video_dit_high.time_embedding)
-        print("[distillation_trainer]  real_score  after FSDP wrap time_embedding 权重形状:", real_score.video_dit_high.time_embedding[0].weight.shape)
-        print("[distillation_trainer]  real_score  before FSDP wrap time_embedding 权重位置:", real_score.video_dit_high.time_embedding[0].weight.device)
-        print("[distillation_trainer]  real_score  after FSDP wrap time_embedding 权重维度:", real_score.video_dit_high.time_embedding[0].weight.dim())
-        print("=" * 50)
 
         # -- peripherals placement --
         text_offload = getattr(cfg, "text_encoder_cpu_offload", True)
-        self.master.text_encoder.to("cpu" if text_offload else self.device)
+        self._move_module_to_device(
+            self.master.text_encoder, "cpu" if text_offload else self.device
+        )
         self.master.text_encoder.requires_grad_(False)
         if self.i2v:
-            # video_vae needed on-GPU for first-frame encoding
-            self.master.video_vae.to(self.device, dtype=self.dtype)
+            self._move_module_to_device(self.master.video_vae, self.device)
         else:
-            self.master.video_vae.to("cpu")
+            self._move_module_to_device(self.master.video_vae, "cpu")
         self.master.video_vae.requires_grad_(False)
-        self.master.audio_vae.to("cpu")
+        self._move_module_to_device(self.master.audio_vae, "cpu")
         self.master.audio_vae.requires_grad_(False)
-        self.master.audio_dit.to(self.device, dtype=self.dtype)
-        self.master.dual_tower_bridge.to(self.device, dtype=self.dtype)
 
         audio_dit_offload = getattr(cfg, "audio_dit_cpu_offload", True)
         bridge_offload = getattr(cfg, "dual_tower_bridge_cpu_offload", True)
         self._audio_dit_offload = audio_dit_offload
         self._bridge_offload = bridge_offload
-        if audio_dit_offload:
-            self.master.audio_dit.to("cpu")
-        if bridge_offload:
-            self.master.dual_tower_bridge.to("cpu")
+        self._move_module_to_device(
+            self.master.audio_dit, "cpu" if audio_dit_offload else self.device
+        )
+        self._move_module_to_device(
+            self.master.dual_tower_bridge, "cpu" if bridge_offload else self.device
+        )
         self.master.audio_dit.requires_grad_(False)
         self.master.dual_tower_bridge.requires_grad_(False)
 
@@ -353,6 +359,8 @@ class DistillationTrainer:
                           device=y_vae.device, dtype=y_vae.dtype)
         msk[:, :, 0, :, :] = 1
         y = torch.cat([msk, y_vae], dim=1)  # [B, 20, F_lat, H_lat, W_lat]
+
+        self._move_module_to_device(pipe.video_vae, "cpu")
         return y
 
     # ============================================================
@@ -406,17 +414,18 @@ class DistillationTrainer:
         with torch.no_grad():
             # text encoder
             text_offload = getattr(cfg, "text_encoder_cpu_offload", True)
+            current_device = torch.device(f'cuda:{torch.cuda.current_device()}')
             if text_offload:
-                self.master.text_encoder.to(self.device)
-            cond = {"prompt_embeds": self.master._get_t5_prompt_embeds(text_prompts, device=self.device)}
+                self._move_module_to_device(self.master.text_encoder, current_device)
+            cond = {"prompt_embeds": self.master._get_t5_prompt_embeds(text_prompts, device=current_device)}
             if not getattr(self, "_uncond_cache", None):
                 neg = [cfg.negative_prompt] * batch_size
                 self._uncond_cache = {
-                    "prompt_embeds": self.master._get_t5_prompt_embeds(neg, device=self.device).detach()
+                    "prompt_embeds": self.master._get_t5_prompt_embeds(neg, device=current_device).detach()
                 }
             uncond = self._uncond_cache
             if text_offload:
-                self.master.text_encoder.to("cpu")
+                self._move_module_to_device(self.master.text_encoder, "cpu")
 
             if self.i2v:
                 # batch from ShardingLMDBDataset:
@@ -432,10 +441,11 @@ class DistillationTrainer:
                 self._maybe_build_x_bound(batch_size, cond, y=y)
 
         if self._audio_dit_offload:
-            self.master.audio_dit.to(self.device)
+            self._move_module_to_device(self.master.audio_dit, self.device)
         if self._bridge_offload:
-            self.master.dual_tower_bridge.to(self.device)
+            self._move_module_to_device(self.master.dual_tower_bridge, self.device)
 
+        print(f"[fwdbwd_one_step] initial_latent:{initial_latent.shape}")
         if train_generator:
             loss, log = self.model.generator_loss(
                 image_or_video_shape=shape,
@@ -455,10 +465,10 @@ class DistillationTrainer:
                 grad_norm = torch.tensor(raw_norm)
 
             if self._audio_dit_offload:
-                self.master.audio_dit.to("cpu")
+                self._move_module_to_device(self.master.audio_dit, "cpu")
             if self._bridge_offload:
-                self.master.dual_tower_bridge.to("cpu")
-
+                self._move_module_to_device(self.master.dual_tower_bridge, "cpu")
+            print(f"[fwdbwd_one_step] generator_loss: {loss.detach()}, generator_grad_norm: {grad_norm.detach()}")
             log.update({"generator_loss": loss.detach(), "generator_grad_norm": grad_norm.detach()})
             return log
         else:
@@ -480,10 +490,11 @@ class DistillationTrainer:
                 grad_norm = torch.tensor(raw_norm)
 
             if self._audio_dit_offload:
-                self.master.audio_dit.to("cpu")
+                self._move_module_to_device(self.master.audio_dit, "cpu")
             if self._bridge_offload:
-                self.master.dual_tower_bridge.to("cpu")
+                self._move_module_to_device(self.master.dual_tower_bridge, "cpu")
 
+            print(f"[fwdbwd_one_step] critic_loss: {loss.detach()}, critic_grad_norm: {grad_norm.detach()}")
             log.update({"critic_loss": loss.detach(), "critic_grad_norm": grad_norm.detach()})
             return log
 
@@ -519,41 +530,48 @@ class DistillationTrainer:
             print(f"[Distill] Training {cfg.training_target} for {max_steps} steps")
         start_step = self.step
 
-        while self.step < start_step + max_steps:
-            train_gen = (self.step % cfg.dfake_gen_update_ratio == 0)
+        remaining_steps = max(0, start_step + max_steps - self.step)
 
-            if train_gen:
-                self.generator_optimizer.zero_grad(set_to_none=True)
-                _ = self.fwdbwd_one_step(next(self.dataloader), True)
-                self.generator_optimizer.step()
-                # EMA
-                if self.generator_ema is None and self.ema_weight > 0 and self.step >= self.ema_start_step:
-                    active = self.model.generator.video_dit_high if cfg.training_target == "high_noise" \
-                        else self.model.generator.video_dit_low
-                    self.generator_ema = (EMA_FSDP if self.world_size > 1 else EMA)(active, decay=self.ema_weight)
-                elif self.generator_ema is not None:
-                    active = self.model.generator.video_dit_high if cfg.training_target == "high_noise" \
-                        else self.model.generator.video_dit_low
-                    self.generator_ema.update(active)
+        # while self.step < start_step + max_steps:
+        with tqdm(total=remaining_steps, initial=0, desc="Training", disable=not self.is_main) as pbar:
+            for _ in range(remaining_steps):
+                train_gen = (self.step % cfg.dfake_gen_update_ratio == 0)
+                print(f"[Distill] train_gen:{train_gen} step:{self.step}")
+                if train_gen:
+                    self.generator_optimizer.zero_grad(set_to_none=True)
+                    _ = self.fwdbwd_one_step(next(self.dataloader), True)
+                    self.generator_optimizer.step()
+                    # EMA
+                    if self.generator_ema is None and self.ema_weight > 0 and self.step >= self.ema_start_step:
+                        active = self.model.generator.video_dit_high if cfg.training_target == "high_noise" \
+                            else self.model.generator.video_dit_low
+                        self.generator_ema = (EMA_FSDP if self.world_size > 1 else EMA)(active, decay=self.ema_weight)
+                    elif self.generator_ema is not None:
+                        active = self.model.generator.video_dit_high if cfg.training_target == "high_noise" \
+                            else self.model.generator.video_dit_low
+                        self.generator_ema.update(active)
 
-            self.critic_optimizer.zero_grad(set_to_none=True)
-            _ = self.fwdbwd_one_step(next(self.dataloader), False)
-            self.critic_optimizer.step()
+                self.critic_optimizer.zero_grad(set_to_none=True)
+                _ = self.fwdbwd_one_step(next(self.dataloader), False)
+                self.critic_optimizer.step()
 
-            self.step += 1
+                self.step += 1
 
-            if (not getattr(cfg, "no_save", False)) and self.step % cfg.log_iters == 0:
-                self.save()
+                if (not getattr(cfg, "no_save", False)) and self.step % cfg.log_iters == 0:
+                    self.save()
 
-            if self.step % getattr(cfg, "gc_interval", 100) == 0:
-                gc.collect()
-                torch.cuda.empty_cache()
+                if self.step % getattr(cfg, "gc_interval", 100) == 0:
+                    gc.collect()
+                    torch.cuda.empty_cache()
 
-            if self.is_main:
-                now = time.time()
-                if self.previous_time is not None:
-                    print(f"[step {self.step}] iter={now - self.previous_time:.2f}s")
-                self.previous_time = now
+                # 更新进度条及耗时信息（仅主进程）
+                if self.is_main:
+                    now = time.time()
+                    if self.previous_time is not None:
+                        iter_time = now - self.previous_time
+                        pbar.set_postfix({"iter": f"{iter_time:.2f}s", "step": self.step})
+                    self.previous_time = now
+                    pbar.update(1)
 
         self.save()
         if self.is_main:

@@ -20,6 +20,83 @@ import torch.nn.functional as F
 
 from mova.distill.pipeline.bidirectional_training import BidirectionalTrainingPipeline
 
+def log_memory(tag: str):
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        max_allocated = torch.cuda.max_memory_allocated() / 1024**3
+        if dist.is_initialized() and dist.get_rank() == 0:
+            print(f"[MEM {tag}] alloc={allocated:.2f}GB | "
+                f"reserved={reserved:.2f}GB | peak={max_allocated:.2f}GB")
+
+
+def _estimate_module_memory(module, device=None):
+    total_params = 0
+    total_bytes = 0
+    on_device_params = 0
+    on_device_bytes = 0
+    for p in module.parameters():
+        numel = p.numel()
+        total_params += numel
+        total_bytes += numel * p.element_size()
+        if device is not None and p.device == torch.device(device):
+            on_device_params += numel
+            on_device_bytes += numel * p.element_size()
+        elif device is None:
+            on_device_params += numel
+            on_device_bytes += numel * p.element_size()
+    for b in module.buffers():
+        numel = b.numel()
+        total_bytes += numel * b.element_size()
+        if device is not None and b.device == torch.device(device):
+            on_device_bytes += numel * b.element_size()
+        elif device is None:
+            on_device_bytes += numel * b.element_size()
+    return total_params, total_bytes, on_device_params, on_device_bytes
+
+
+def log_model_devices(tag: str, model: "MOVADMD"):
+    if not torch.cuda.is_available():
+        return
+    if dist.is_initialized() and dist.get_rank() != 0:
+        return
+
+    allocated = torch.cuda.memory_allocated() / 1024**3
+    print(f"\n{'='*60}")
+    print(f"[MODEL_DEVICES {tag}] total_alloc={allocated:.2f}GB")
+    print(f"{'='*60}")
+
+    components = {}
+
+    components["master.audio_dit"] = model.master.audio_dit
+    components["master.dual_tower_bridge"] = model.master.dual_tower_bridge
+    components["master.video_dit"] = model.master.video_dit
+    components["master.video_dit_2"] = model.master.video_dit_2
+    components["master.video_vae"] = model.master.video_vae
+    components["master.audio_vae"] = model.master.audio_vae
+    components["master.text_encoder"] = model.master.text_encoder
+
+    components["generator.video_dit_high"] = model.generator.video_dit_high
+    components["generator.video_dit_low"] = model.generator.video_dit_low
+
+    components["real_score.video_dit_high"] = model.real_score.video_dit_high
+    components["real_score.video_dit_low"] = model.real_score.video_dit_low
+
+    components["fake_score.video_dit_high"] = model.fake_score.video_dit_high
+    components["fake_score.video_dit_low"] = model.fake_score.video_dit_low
+
+    gpu_total_bytes = 0
+    for name, mod in components.items():
+        _, _, on_dev_p, on_dev_bytes = _estimate_module_memory(mod, device="cuda")
+        if on_dev_p > 0:
+            gpu_bytes_str = f"{on_dev_bytes / 1024**3:.2f}GB"
+        else:
+            gpu_bytes_str = "cpu"
+        gpu_total_bytes += on_dev_bytes
+        print(f"  {name:40s}  params_on_gpu={on_dev_p/1e6:.1f}M  mem={gpu_bytes_str}")
+
+    print(f"  {'TOTAL (components above)':40s}  gpu_mem={gpu_total_bytes / 1024**3:.2f}GB")
+    print(f"{'='*60}\n")
 
 class MOVADMD(torch.nn.Module):
     """A self-contained module that bundles the generator / real_score / fake_score
@@ -116,6 +193,20 @@ class MOVADMD(torch.nn.Module):
                 timestep_shift=self.timestep_shift,
             )
 
+    def _offload_master_pipeline(self):
+        """Offload all master_pipeline components to CPU to free GPU memory"""
+        if hasattr(self.master, 'video_dit'):
+            self.master.video_dit.to('cpu')
+        if hasattr(self.master, 'video_dit_2'):
+            self.master.video_dit_2.to('cpu')
+        if hasattr(self.master, 'audio_dit'):
+            self.master.audio_dit.to('cpu')
+        if hasattr(self.master, 'dual_tower_bridge'):
+            self.master.dual_tower_bridge.to('cpu')
+        torch.cuda.empty_cache()
+        if dist.is_initialized() and dist.get_rank() == 0:
+            print(f"[OFFLOAD] master_pipeline components moved to CPU")
+
     def _run_generator(self, image_or_video_shape, conditional_dict, audio_latents=None,
                        initial_latent=None, y=None, cp_mesh=None):
         """Backward-simulate noise → student → x_pred. Output in SFP layout
@@ -141,20 +232,38 @@ class MOVADMD(torch.nn.Module):
             conditional_dict = dict(conditional_dict)
             conditional_dict["initial_latent"] = initial_latent
 
+        log_model_devices("[_run_generator] befor inference_with_trajectory", self)
         flow_pred, pred_image = self.inference_pipeline.inference_with_trajectory(
             noise=noise, y=y, audio_latents=audio_latents, cp_mesh=cp_mesh, **conditional_dict,
         )
+        log_model_devices("[_run_generator] after inference_with_trajectory", self)
+
+        self._offload_master_pipeline()
+        
+        torch.cuda.empty_cache()
         return flow_pred, pred_image, None, noise
 
     def _compute_kl_grad(self, noisy, clean, timestep_id, conditional_dict, unconditional_dict,
                           normalization=True, y=None, audio_latents=None, cp_mesh=None):
         # fake score
+        log_memory("[_compute_kl_grad] befor pred_fake")
+        log_model_devices("[_compute_kl_grad] befor pred_fake", self)
         _, pred_fake = self.fake_score(
             noisy_image_or_video=noisy,
             conditional_dict=conditional_dict,
             timestep_id=timestep_id, y=y,
             audio_latents=audio_latents, cp_mesh=cp_mesh,
         )
+        pred_fake = pred_fake.cpu()
+        self._offload_master_pipeline()
+        torch.cuda.empty_cache()
+        print(f"[_compute_kl_grad] pred_fake:{pred_fake.shape} {pred_fake.device}")
+        print(f"[_compute_kl_grad] self.fake_score:{self.fake_score.video_dit_high.device} {self.fake_score.video_dit_low.device}")
+
+
+        log_memory("[_compute_kl_grad] befor pred_real_cond")
+        log_model_devices("[_compute_kl_grad] befor pred_real_cond", self)
+        print(f"[_compute_kl_grad] self.real_score:{self.real_score.video_dit_high.device} {self.real_score.video_dit_low.device}")
         # real score (cond + uncond → CFG)
         _, pred_real_cond = self.real_score(
             noisy_image_or_video=noisy,
@@ -162,15 +271,29 @@ class MOVADMD(torch.nn.Module):
             timestep_id=timestep_id, y=y,
             audio_latents=audio_latents, cp_mesh=cp_mesh,
         )
+        pred_real_cond = pred_real_cond.cpu()
+        self._offload_master_pipeline()
+        torch.cuda.empty_cache()
+        print(f"pred_real_cond:{pred_real_cond.shape}")
+
+        log_memory("[_compute_kl_grad] befor pred_real_uncond")
+        log_model_devices("[_compute_kl_grad] befor pred_real_uncond", self)
         _, pred_real_uncond = self.real_score(
             noisy_image_or_video=noisy,
             conditional_dict=unconditional_dict,
             timestep_id=timestep_id, y=y,
             audio_latents=audio_latents, cp_mesh=cp_mesh,
         )
+        self._offload_master_pipeline()
+        torch.cuda.empty_cache()
+        print(f"pred_real_uncond:{pred_real_uncond.shape}")
+
+        pred_real_cond = pred_real_cond.to(device=pred_real_uncond.device, dtype=pred_real_uncond.dtype)
         pred_real = pred_real_cond + (pred_real_cond - pred_real_uncond) * self.real_guidance_scale
 
+        pred_fake = pred_fake.to(device=pred_real.device, dtype=pred_real.dtype)
         grad = pred_fake - pred_real
+        clean = clean.to(device=grad.device, dtype=grad.dtype)
         if normalization:
             normalizer = torch.abs(clean - pred_real).mean(dim=[1, 2, 3, 4], keepdim=True)
             grad = grad / (normalizer + 1e-8)
@@ -184,6 +307,8 @@ class MOVADMD(torch.nn.Module):
     def generator_loss(self, image_or_video_shape, conditional_dict, unconditional_dict,
                        clean_latent=None, initial_latent=None, y=None,
                        audio_latents=None, cp_mesh=None):
+        log_memory("[generator_loss] befor _run_generator")
+        log_model_devices("[generator_loss] befor _run_generator", self)
         flow_pred, pred_image, _gradient_mask, _noise = self._run_generator(
             image_or_video_shape=image_or_video_shape,
             conditional_dict=conditional_dict,
@@ -192,9 +317,17 @@ class MOVADMD(torch.nn.Module):
             y=y,
             cp_mesh=cp_mesh,
         )
+        log_memory("[generator_loss] after _run_generator")
+        log_model_devices("[generator_loss] after _run_generator", self)
 
-        original = pred_image
+        original = pred_image.cpu()
         bsz, num_frame = pred_image.shape[:2]
+
+        if initial_latent is not None:
+            conditional_dict = dict(conditional_dict)
+            conditional_dict["initial_latent"] = initial_latent
+            unconditional_dict = dict(unconditional_dict)
+            unconditional_dict["initial_latent"] = initial_latent
 
         with torch.no_grad():
             t = self._get_timestep(self.min_timestep, self.max_timestep, bsz, num_frame,
@@ -214,13 +347,21 @@ class MOVADMD(torch.nn.Module):
                     timestep_id.flatten(0, 1), self.timestep_bound,
                 ).detach().unflatten(0, (bsz, num_frame))
 
+            del pred_image, flow_pred, _noise
+            torch.cuda.empty_cache()
+
+            log_memory("[generator_loss] befor _compute_kl_grad")
+            log_model_devices("[generator_loss] befor _compute_kl_grad", self)
             grad, log_dict = self._compute_kl_grad(
                 noisy=noisy, clean=original, timestep_id=timestep_id,
                 conditional_dict=conditional_dict,
                 unconditional_dict=unconditional_dict,
                 y=y, audio_latents=audio_latents, cp_mesh=cp_mesh,
             )
+            log_memory("[generator_loss] after _compute_kl_grad")
+            log_model_devices("[generator_loss] after _compute_kl_grad", self)
 
+        original = original.to(device=grad.device)
         dmd_loss = 0.5 * F.mse_loss(
             original.double(),
             (original.double() - grad.double()).detach(),
@@ -260,12 +401,26 @@ class MOVADMD(torch.nn.Module):
                 critic_id.flatten(0, 1), self.timestep_bound,
             ).unflatten(0, (bsz, num_frame))
 
+        generated_cpu = generated.cpu()
+        del generated
+        torch.cuda.empty_cache()
+
+        if initial_latent is not None:
+            conditional_dict = dict(conditional_dict)
+            conditional_dict["initial_latent"] = initial_latent
+
+        log_memory("[generator_loss] befor flow_pred_fake")
+        log_model_devices("[generator_loss] befor flow_pred_fake", self)
         flow_pred_fake, _ = self.fake_score(
             noisy_image_or_video=noisy_gen,
             conditional_dict=conditional_dict,
             timestep_id=critic_id, y=y,
             audio_latents=audio_latents, cp_mesh=cp_mesh,
         )
+        log_memory("[generator_loss] after flow_pred_fake 1")
+        torch.cuda.empty_cache()
+        log_memory("[generator_loss] after flow_pred_fake 2")
+        log_model_devices("[generator_loss] after flow_pred_fake", self)
 
         sigmas = self.scheduler.get_train_sigmas(noisy_gen.device)
         t_vals = sigmas[critic_id].reshape(-1, 1, 1, 1).to(noisy_gen.dtype)
@@ -282,6 +437,7 @@ class MOVADMD(torch.nn.Module):
         else:
             fake_image = (noisy_gen.flatten(0, 1) - flow_pred_fake.flatten(0, 1) * t_vals).unflatten(0, (bsz, num_frame))
 
+        generated = generated_cpu.to(device=fake_image.device, dtype=fake_image.dtype)
         denoising_loss = torch.mean((fake_image - generated) ** 2)
         if dist.is_initialized() and dist.get_rank() == 0:
             print(f"[DMD] denoising_loss: {denoising_loss.item():.6f}")

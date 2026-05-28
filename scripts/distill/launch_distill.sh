@@ -27,11 +27,6 @@ set -e
 NNODES=${NNODES:-1}
 NODE_RANK=${NODE_RANK:-0}
 NPROC=${NPROC_PER_NODE:-1}
-
-if [ "${NPROC}" = "1" ]; then
-    echo "[single-gpu] nproc_per_node=1, running single-GPU mode"
-fi
-
 MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 MASTER_PORT=${MASTER_PORT:-29500}
 RDZV_ID=${RDZV_ID:-mova_distill}
@@ -107,3 +102,4 @@ case "${STEP}" in
     exit 1
     ;;
 esac
+

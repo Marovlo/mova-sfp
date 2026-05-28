@@ -63,7 +63,7 @@ class ShardingLMDBDataset(Dataset):
         env = self.envs[shard_id]
         shape = self.latents_shape[shard_id]
         img_shape = self.img_shapes[shard_id]
-        # print(f"[ShardingLMDBDataset] latent:{shape} img:{img_shape}")
+        print(f"[ShardingLMDBDataset] latent:{shape} img:{img_shape}")
 
         latents = retrieve_row_from_lmdb(env, "latents", np.float16, local_idx, shape=shape[1:])
         if len(latents.shape) == 4:
@@ -74,6 +74,14 @@ class ShardingLMDBDataset(Dataset):
         # First-frame RGB (480×832×3 uint8 → tensor [-1,1])
         try:
             img_np = retrieve_row_from_lmdb(env, "img", np.uint8, local_idx, shape=img_shape[1:])
+
+            if img_np.ndim == 4 and img_np.shape[0] == 1:
+                img_np = img_np.squeeze(0)  # 变为 (C, H, W)
+            
+            # 2. 如果是 CHW 格式 (例如通道数为 1 或 3)，将其转置为 HWC 格式 (H, W, C)
+            if img_np.ndim == 3 and img_np.shape[0] in [1, 3]: 
+                img_np = img_np.transpose(1, 2, 0)  # 变为 (H, W, C)
+
             img = Image.fromarray(img_np)
             img = TF.to_tensor(img).sub_(0.5).div_(0.5)  # [C, H, W] in [-1,1]
         except KeyError:
