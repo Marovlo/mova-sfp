@@ -889,6 +889,7 @@ class MOVATrain(BasePipeline, DiffusionPipeline):
         audio_timestep: Optional[torch.Tensor],
         video_fps: float,
         cp_mesh=None,
+        is_training: bool = False
     ):
         """
         Args:
@@ -902,6 +903,8 @@ class MOVATrain(BasePipeline, DiffusionPipeline):
                 shape=[B, C=20, T // 4 + 1, H // 8, W // 8]
                 dtype=bf16
         """
+        if is_training:
+            self.training = is_training
         audio_context = visual_context = context  # [B, 512, C=4096]
 
         if audio_timestep is None:
@@ -1544,6 +1547,8 @@ def MOVATrain_from_pretrained(
     import os
     use_deepspeed = os.environ.get("ACCELERATE_USE_DEEPSPEED", "false").lower() == "true"
     use_fsdp = os.environ.get("ACCELERATE_USE_FSDP", "false").lower() == "true"
+    if dist.is_initialized() and dist.get_rank() == 0:
+        print(f"[MOVATrain_from_pretrained] use_deepspeed:{use_deepspeed} use_fsdp:{use_fsdp}")
     
     if use_deepspeed:
         # For DeepSpeed ZeRO-3: try to use empty weights + dispatch to avoid GPU spike

@@ -189,21 +189,10 @@ class MOVAVideoDiTWrapper(nn.Module):
         active_high = self.video_dit_high
         active_low = self.video_dit_low
         active_visual_dit = active_high if self.target == "high_noise" else active_low
-        print("=" * 50)
-        print("[mova_dit_wrapper]  active_visual_dit time_embedding 层结构:", active_visual_dit.time_embedding)
-        print("[mova_dit_wrapper]  active_visual_dit time_embedding 权重形状:", active_visual_dit.time_embedding[0].weight.shape)
-        print("[mova_dit_wrapper]  active_visual_dit time_embedding 权重维度:", active_visual_dit.time_embedding[0].weight.dim())
-        print("=" * 50)
 
         # Swap the master's video DiT references so that inference_single_step
         # uses *our* DiTs. We restore on exit (also on exception).
         prev_high_forward, prev_low_forward = swap_video_dit(pipe, high=active_high, low=active_low)
-
-        print("=" * 50)
-        print("[mova_dit_wrapper]  active_visual_dit after swap time_embedding 层结构:", active_visual_dit.time_embedding)
-        print("[mova_dit_wrapper]  active_visual_dit after swap time_embedding 权重形状:", active_visual_dit.time_embedding[0].weight.shape)
-        print("[mova_dit_wrapper]  active_visual_dit after swap time_embedding 权重维度:", active_visual_dit.time_embedding[0].weight.dim())
-        print("=" * 50)
 
         try:
             flow_pred_bcfhw, _audio_pred = pipe.inference_single_step(
@@ -216,6 +205,7 @@ class MOVAVideoDiTWrapper(nn.Module):
                 audio_timestep=audio_input_timestep,
                 video_fps=video_fps,
                 cp_mesh=cp_mesh,
+                is_training=True
             )
         finally:
             self.video_dit_high.forward = prev_high_forward
