@@ -27,7 +27,7 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader, distributed as torch_dist_data
 
 from mova.distill.model.dmd import MOVADMD
-from mova.distill.model.builder import build_distill_modules
+from mova.distill.model.builder import build_distill_modules, encode_text_prompts
 from mova.distill.model.mova_dit_wrapper import MOVAVideoDiTWrapper
 from mova.diffusion.models.wan_video_dit import DiTBlock as WanDiTBlock
 from mova.distill.utils.distributed import (
@@ -50,18 +50,8 @@ class DistillationTrainer:
         torchrun ... train_distill.py --config ... --stage low
     """
 
-    # ============================================================
-    # Device-move helper (works around FSDP .to() interception)
-    # ============================================================
     @staticmethod
     def _move_module_to_device(module, device):
-        """Move a non-FSDP module to ``device`` deterministically.
-
-        Under FSDP, ``module.to(device)`` may be intercepted and leave some
-        sub-module parameters on CPU.  This helper first calls ``.to()`` (which
-        moves most things) and then *explicitly* moves every parameter and
-        buffer, guaranteeing that nothing stays behind.
-        """
         module.to(device)
         with torch.no_grad():
             for p in module.parameters():
@@ -73,7 +63,6 @@ class DistillationTrainer:
         self.config = config
         self.step = 0
 
-        # ---------- distributed ----------
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         launch_distributed_job()
@@ -92,7 +81,6 @@ class DistillationTrainer:
         self.i2v = getattr(config, "i2v", False)
         self.disable_wandb = getattr(config, "disable_wandb", True)
 
-        # ---------- device mesh (dp / cp / fsdp) ----------
         dp_size = getattr(config, "dp_size", 1)
         cp_size = getattr(config, "cp_size", 1)
         if self.world_size > 1 and (dp_size > 1 or cp_size > 1):
@@ -106,8 +94,6 @@ class DistillationTrainer:
             self._fsdp_size = self.world_size
             self.cp_mesh = None
 
-        # ---------- build distill modules ----------
-        # Setup Context Parallel (yunchang) if cp_size > 1
         if self.cp_mesh is not None:
             from yunchang import set_seq_parallel_pg
             cp_sz = self._cp_size
@@ -129,30 +115,26 @@ class DistillationTrainer:
 
         self._modules = build_distill_modules(
             pretrained_path=config.pretrained_path,
+            training_target=config.training_target,
             use_gradient_checkpointing=config.gradient_checkpointing,
             use_gradient_checkpointing_offload=getattr(config, "gradient_checkpointing_offload", False),
             torch_dtype=self.dtype,
         )
-        self.master = self._modules.master
 
         self._setup()
 
-    # ============================================================
-    # Setup
-    # ============================================================
     def _setup(self):
         cfg = self.config
-        target = cfg.training_target  # "high_noise" or "low_noise"
+        target = cfg.training_target
         m = self._modules
 
-        # -- high_noise_teacher for low stage --
         high_noise_teacher = None
         if target == "low_noise":
             import copy
-            distill_path = cfg.high_noise_distill_ckpt  # .pt from stage 1
+            distill_path = cfg.high_noise_distill_ckpt
             if self.is_main:
                 print(f"[Distill] Loading high-noise distilled ckpt: {distill_path}")
-            teacher_dit_high = copy.deepcopy(m.real_high)
+            teacher_dit_high = copy.deepcopy(m.real_dit)
             state = torch.load(distill_path, map_location="cpu")
             if "generator" in state:
                 state = state["generator"]
@@ -160,30 +142,36 @@ class DistillationTrainer:
             teacher_dit_high.requires_grad_(False).eval()
 
             high_noise_teacher = MOVAVideoDiTWrapper(
-                master_pipeline=self.master,
-                video_dit_high=teacher_dit_high,
-                video_dit_low=m.real_low,
+                video_dit=teacher_dit_high,
                 target="high_noise",
                 boundary_step=cfg.boundary_step,
                 timestep_shift=cfg.timestep_shift,
+                audio_dit=m.audio_dit,
+                dual_tower_bridge=m.dual_tower_bridge,
+                scheduler=m.scheduler,
+                use_gradient_checkpointing=m.use_gradient_checkpointing,
+                use_gradient_checkpointing_offload=m.use_gradient_checkpointing_offload,
             )
 
-        # -- wrappers --
-        def _mk(dit_h, dit_l, tgt):
+        def _mk(dit, tgt):
             return MOVAVideoDiTWrapper(
-                master_pipeline=self.master,
-                video_dit_high=dit_h, video_dit_low=dit_l,
-                target=tgt, boundary_step=cfg.boundary_step,
+                video_dit=dit,
+                target=tgt,
+                boundary_step=cfg.boundary_step,
                 timestep_shift=cfg.timestep_shift,
+                audio_dit=m.audio_dit,
+                dual_tower_bridge=m.dual_tower_bridge,
+                scheduler=m.scheduler,
+                use_gradient_checkpointing=m.use_gradient_checkpointing,
+                use_gradient_checkpointing_offload=m.use_gradient_checkpointing_offload,
             )
 
-        generator = _mk(m.generator_high, m.generator_low, target)
-        real_score = _mk(m.real_high, m.real_low, target)
-        fake_score = _mk(m.fake_high, m.fake_low, target)
+        generator = _mk(m.generator_dit, target)
+        real_score = _mk(m.real_dit, target)
+        fake_score = _mk(m.fake_dit, target)
         for p in real_score.parameters():
             p.requires_grad_(False)
 
-        # -- FSDP wrap --
         wrap_kw = dict(
             sharding_strategy=cfg.sharding_strategy,
             mixed_precision=cfg.mixed_precision,
@@ -191,59 +179,129 @@ class DistillationTrainer:
             transformer_module={WanDiTBlock} if cfg.fsdp_wrap_strategy == "transformer" else None,
             device_mesh=self.mesh,
         )
-        generator.video_dit_high = fsdp_wrap(generator.video_dit_high, cpu_offload=True, **wrap_kw)
-        generator.video_dit_low = fsdp_wrap(generator.video_dit_low, cpu_offload=True, **wrap_kw)
-        generator.model = generator.video_dit_high if target == "high_noise" else generator.video_dit_low
+        
+        def _count_params(module):
+            return sum(p.numel() for p in module.parameters())
+        
+        def _param_memory_gb(module):
+            total_bytes = sum(p.numel() * p.element_size() for p in module.parameters())
+            return total_bytes / 1e9
+        
+        gen_params_full = _count_params(generator.video_dit)
+        fake_params_full = _count_params(fake_score.video_dit)
+        real_params_full = _count_params(real_score.video_dit)
+        total_params_full = gen_params_full + fake_params_full + real_params_full
+        
+        if self.is_main:
+            print(f"\n{'='*70}")
+            print(f"[FSDP VERIFICATION] Configuration:")
+            print(f"  world_size: {self.world_size}")
+            print(f"  dp_size: {self._dp_size}, cp_size: {self._cp_size}, fsdp_size: {self._fsdp_size}")
+            print(f"  mesh: {self.mesh}")
+            print(f"  cp_mesh: {self.cp_mesh}")
+            print(f"  sharding_strategy: {cfg.sharding_strategy}")
+            print(f"  mixed_precision: {cfg.mixed_precision}")
+            print(f"  wrap_strategy: {cfg.fsdp_wrap_strategy}")
+            
+            if self._dp_size > 1:
+                print(f"\n[DP VERIFICATION] Data Parallel Configuration:")
+                print(f"  dp_size: {self._dp_size}")
+                print(f"  Effective batch_size per DP group: {getattr(cfg, 'batch_size', 1) * self._dp_size}")
+                if self.mesh is not None:
+                    try:
+                        dp_mesh = self.mesh["dp"]
+                        print(f"  dp_mesh: {dp_mesh}")
+                        print(f"  DP ranks: {dp_mesh.mesh.tolist() if hasattr(dp_mesh.mesh, 'tolist') else dp_mesh.mesh}")
+                    except KeyError:
+                        print(f"  dp_mesh: Not found in device mesh")
+                print(f"  ✓ DP enabled: Each rank processes different data, gradients synchronized across DP ranks")
+            else:
+                print(f"\n[DP VERIFICATION] DP disabled (dp_size=1)")
+            
+            print(f"\n[FSDP VERIFICATION] FULL Model Size (Before FSDP):")
+            print(f"  generator.video_dit: {gen_params_full/1e6:.2f}M params ({_param_memory_gb(generator.video_dit):.2f} GB)")
+            print(f"  fake_score.video_dit: {fake_params_full/1e6:.2f}M params ({_param_memory_gb(fake_score.video_dit):.2f} GB)")
+            print(f"  real_score.video_dit: {real_params_full/1e6:.2f}M params ({_param_memory_gb(real_score.video_dit):.2f} GB)")
+            print(f"  TOTAL: {total_params_full/1e6:.2f}M params ({_param_memory_gb(generator.video_dit)+_param_memory_gb(fake_score.video_dit)+_param_memory_gb(real_score.video_dit):.2f} GB)")
+            print(f"{'='*70}\n")
+        
+        generator.video_dit = fsdp_wrap(generator.video_dit, cpu_offload=True, **wrap_kw)
+        generator.model = generator.video_dit
 
-        fake_score.video_dit_high = fsdp_wrap(fake_score.video_dit_high, cpu_offload=True, **wrap_kw)
-        fake_score.video_dit_low = fsdp_wrap(fake_score.video_dit_low, cpu_offload=True, **wrap_kw)
-        fake_score.model = fake_score.video_dit_high if target == "high_noise" else fake_score.video_dit_low
+        fake_score.video_dit = fsdp_wrap(fake_score.video_dit, cpu_offload=True, **wrap_kw)
+        fake_score.model = fake_score.video_dit
 
-        real_score.video_dit_high = fsdp_wrap(real_score.video_dit_high, cpu_offload=True, **wrap_kw)
-        real_score.video_dit_low = fsdp_wrap(real_score.video_dit_low, cpu_offload=True, **wrap_kw)
-        real_score.model = real_score.video_dit_high if target == "high_noise" else real_score.video_dit_low
+        real_score.video_dit = fsdp_wrap(real_score.video_dit, cpu_offload=True, **wrap_kw)
+        real_score.model = real_score.video_dit
 
         if high_noise_teacher is not None:
-            high_noise_teacher.video_dit_high = fsdp_wrap(
-                high_noise_teacher.video_dit_high, cpu_offload=False, **wrap_kw,
+            high_noise_teacher.video_dit = fsdp_wrap(
+                high_noise_teacher.video_dit, cpu_offload=False, **wrap_kw,
             )
+        
+        gen_params_sharded = _count_params(generator.video_dit)
+        fake_params_sharded = _count_params(fake_score.video_dit)
+        real_params_sharded = _count_params(real_score.video_dit)
+        total_sharded = gen_params_sharded + fake_params_sharded + real_params_sharded
+        
+        if self.is_main:
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            print(f"\n{'='*70}")
+            print(f"[FSDP VERIFICATION] SHARDED Model Size (After FSDP, rank {self.global_rank}):")
+            print(f"  generator.video_dit: {gen_params_sharded/1e6:.2f}M params")
+            print(f"  fake_score.video_dit: {fake_params_sharded/1e6:.2f}M params")
+            print(f"  real_score.video_dit: {real_params_sharded/1e6:.2f}M params")
+            print(f"  TOTAL on this rank: {total_sharded/1e6:.2f}M params")
+            print(f"\n[FSDP VERIFICATION] FSDP Wrapping Status:")
+            print(f"  generator.video_dit is FSDP: {isinstance(generator.video_dit, FSDP)}")
+            print(f"  fake_score.video_dit is FSDP: {isinstance(fake_score.video_dit, FSDP)}")
+            print(f"  real_score.video_dit is FSDP: {isinstance(real_score.video_dit, FSDP)}")
+            print(f"\n[FSDP VERIFICATION] Memory Reduction:")
+            if total_params_full > 0:
+                reduction_ratio = total_params_full / total_sharded if total_sharded > 0 else 0
+                print(f"  Expected reduction factor: ~{self._fsdp_size}x (fsdp_size)")
+                print(f"  Actual reduction factor: {reduction_ratio:.2f}x")
+                print(f"  Sharding efficiency: {reduction_ratio/self._fsdp_size*100:.1f}%")
+            print(f"{'='*70}\n")
 
-        # -- peripherals placement --
         text_offload = getattr(cfg, "text_encoder_cpu_offload", True)
         self._move_module_to_device(
-            self.master.text_encoder, "cpu" if text_offload else self.device
+            m.text_encoder, "cpu" if text_offload else self.device
         )
-        self.master.text_encoder.requires_grad_(False)
+        m.text_encoder.requires_grad_(False)
         if self.i2v:
-            self._move_module_to_device(self.master.video_vae, self.device)
+            self._move_module_to_device(m.video_vae, self.device)
         else:
-            self._move_module_to_device(self.master.video_vae, "cpu")
-        self.master.video_vae.requires_grad_(False)
-        self._move_module_to_device(self.master.audio_vae, "cpu")
-        self.master.audio_vae.requires_grad_(False)
+            self._move_module_to_device(m.video_vae, "cpu")
+        m.video_vae.requires_grad_(False)
+        self._move_module_to_device(m.audio_vae, "cpu")
+        m.audio_vae.requires_grad_(False)
 
         audio_dit_offload = getattr(cfg, "audio_dit_cpu_offload", True)
         bridge_offload = getattr(cfg, "dual_tower_bridge_cpu_offload", True)
         self._audio_dit_offload = audio_dit_offload
         self._bridge_offload = bridge_offload
         self._move_module_to_device(
-            self.master.audio_dit, "cpu" if audio_dit_offload else self.device
+            m.audio_dit, "cpu" if audio_dit_offload else self.device
         )
         self._move_module_to_device(
-            self.master.dual_tower_bridge, "cpu" if bridge_offload else self.device
+            m.dual_tower_bridge, "cpu" if bridge_offload else self.device
         )
-        self.master.audio_dit.requires_grad_(False)
-        self.master.dual_tower_bridge.requires_grad_(False)
+        m.audio_dit.requires_grad_(False)
+        m.dual_tower_bridge.requires_grad_(False)
 
-        # -- DMD model --
         self.model = MOVADMD(
-            config=cfg, device=self.device,
-            generator=generator, real_score=real_score, fake_score=fake_score,
-            master_pipeline=self.master,
+            config=cfg,
+            device=self.device,
+            generator=generator,
+            real_score=real_score,
+            fake_score=fake_score,
+            scheduler=m.scheduler,
+            shared_audio_dit=m.audio_dit,
+            shared_dual_tower_bridge=m.dual_tower_bridge,
             high_noise_teacher=high_noise_teacher,
         )
 
-        # -- optimizers --
         gen_params = [p for p in self.model.generator.parameters() if p.requires_grad]
         crit_params = [p for p in self.model.fake_score.parameters() if p.requires_grad]
         self.generator_optimizer = torch.optim.AdamW(
@@ -257,18 +315,15 @@ class DistillationTrainer:
             weight_decay=getattr(cfg, "weight_decay", 0.01),
         )
 
-        # -- EMA --
         self.generator_ema: Optional[EMA_FSDP] = None
         self.ema_weight = getattr(cfg, "ema_weight", -1.0)
         self.ema_start_step = getattr(cfg, "ema_start_step", 0)
 
-        # -- high_noise_step_list (for low-noise x_bound build) --
         if target == "low_noise":
             self.high_noise_step_list = torch.tensor(cfg.high_noise_step_list, dtype=torch.long)
         else:
             self.high_noise_step_list = None
 
-        # -- dataloader --
         self._build_dataloader()
 
         self.max_grad_norm_generator = getattr(cfg, "max_grad_norm_generator", 10.0)
@@ -290,12 +345,10 @@ class DistillationTrainer:
             collate = text_collate_fn
 
         if self.world_size > 1:
-            # When using a DeviceMesh with dp > 1, the DistributedSampler should
-            # shard data across dp ranks only (ranks within the same dp group
-            # share the same batch since they are FSDP/CP peers).
             if self.mesh is not None and self._dp_size > 1:
                 dp_group = self.mesh["dp"].get_group()
                 dp_rank = dist.get_rank(dp_group)
+                print(f"[DP DEBUG] rank={self.global_rank}, dp_size={self._dp_size}, dp_rank={dp_rank}, dp_group={dp_group}")
                 sampler = torch_dist_data.DistributedSampler(
                     ds, num_replicas=self._dp_size, rank=dp_rank,
                     shuffle=True, drop_last=True,
@@ -318,25 +371,34 @@ class DistillationTrainer:
         self.dataloader = _cycle(loader)
 
     # ============================================================
+    # Text encoding
+    # ============================================================
+    def _encode_text(self, text_prompts, device):
+        m = self._modules
+        return encode_text_prompts(
+            prompts=text_prompts,
+            tokenizer=m.tokenizer,
+            text_encoder=m.text_encoder,
+            device=device,
+            dtype=self.dtype,
+        )
+
+    # ============================================================
     # I2V helpers
     # ============================================================
     def _encode_first_frame(self, img_rgb: torch.Tensor) -> torch.Tensor:
-        """Encode first-frame RGB tensor to the MOVA 20-channel y condition.
-        img_rgb: [B, C, H, W] in [-1, 1] float.
-        Returns y: [B, 20, F_lat, H_lat, W_lat].
-        """
-        pipe = self.master
+        from mova.distill.model.builder import normalize_video_latents
+
+        m = self._modules
         B = img_rgb.shape[0]
-        cfg_shape = self.config.image_or_video_shape  # [B, F_lat, C, H_lat, W_lat]
-        num_frames = cfg_shape[1]  # F_lat (e.g. 21)
+        cfg_shape = self.config.image_or_video_shape
+        num_frames = cfg_shape[1]
         H_lat, W_lat = cfg_shape[3], cfg_shape[4]
-        # Target pixel resolution = latent × vae_stride (8)
         target_H = H_lat * 8
         target_W = W_lat * 8
         C = img_rgb.shape[1]
-        num_raw_frames = (num_frames - 1) * 4 + 1  # 81 for F_lat=21
+        num_raw_frames = (num_frames - 1) * 4 + 1
 
-        # Resize img to target resolution if needed
         if img_rgb.shape[2] != target_H or img_rgb.shape[3] != target_W:
             img_rgb = torch.nn.functional.interpolate(
                 img_rgb, size=(target_H, target_W), mode="bilinear", align_corners=False,
@@ -344,30 +406,28 @@ class DistillationTrainer:
 
         with torch.no_grad(), torch.autocast("cuda", dtype=self.dtype):
             vae_input = torch.cat([
-                img_rgb.unsqueeze(2),  # [B, C, 1, H, W]
+                img_rgb.unsqueeze(2),
                 torch.zeros(B, C, num_raw_frames - 1, target_H, target_W,
                             device=img_rgb.device, dtype=img_rgb.dtype),
             ], dim=2)
-            y_vae = pipe.video_vae.encode(vae_input).latent_dist.mode()
-            y_vae = pipe.normalize_video_latents(y_vae)
+            y_vae = m.video_vae.encode(vae_input).latent_dist.mode()
+            y_vae = normalize_video_latents(m.video_vae, y_vae)
 
-        # Build mask: [B, 4, F_lat, H_lat, W_lat]
         F_lat = y_vae.shape[2]
         H_lat_actual = y_vae.shape[3]
         W_lat_actual = y_vae.shape[4]
         msk = torch.zeros(B, 4, F_lat, H_lat_actual, W_lat_actual,
                           device=y_vae.device, dtype=y_vae.dtype)
         msk[:, :, 0, :, :] = 1
-        y = torch.cat([msk, y_vae], dim=1)  # [B, 20, F_lat, H_lat, W_lat]
+        y = torch.cat([msk, y_vae], dim=1)
 
-        self._move_module_to_device(pipe.video_vae, "cpu")
+        self._move_module_to_device(m.video_vae, "cpu")
         return y
 
     # ============================================================
     # One step
     # ============================================================
     def _maybe_build_x_bound(self, batch_size, cond, y=None, audio_latents=None):
-        """Low-noise stage: run frozen high_noise teacher from pure noise → x_bound."""
         cfg = self.config
         shape = list(cfg.image_or_video_shape)
         shape[0] = batch_size
@@ -398,6 +458,7 @@ class DistillationTrainer:
 
     def fwdbwd_one_step(self, batch, train_generator: bool):
         cfg = self.config
+        m = self._modules
         self.model.eval()
         if self.step % 20 == 0:
             torch.cuda.empty_cache()
@@ -407,30 +468,25 @@ class DistillationTrainer:
         shape = list(cfg.image_or_video_shape)
         shape[0] = batch_size
 
-        # -- I2V data --
         initial_latent = None
         y = None
 
         with torch.no_grad():
-            # text encoder
             text_offload = getattr(cfg, "text_encoder_cpu_offload", True)
             current_device = torch.device(f'cuda:{torch.cuda.current_device()}')
             if text_offload:
-                self._move_module_to_device(self.master.text_encoder, current_device)
-            cond = {"prompt_embeds": self.master._get_t5_prompt_embeds(text_prompts, device=current_device)}
+                self._move_module_to_device(m.text_encoder, current_device)
+            cond = {"prompt_embeds": self._encode_text(text_prompts, device=current_device)}
             if not getattr(self, "_uncond_cache", None):
                 neg = [cfg.negative_prompt] * batch_size
                 self._uncond_cache = {
-                    "prompt_embeds": self.master._get_t5_prompt_embeds(neg, device=current_device).detach()
+                    "prompt_embeds": self._encode_text(neg, device=current_device).detach()
                 }
             uncond = self._uncond_cache
             if text_offload:
-                self._move_module_to_device(self.master.text_encoder, "cpu")
+                self._move_module_to_device(m.text_encoder, "cpu")
 
             if self.i2v:
-                # batch from ShardingLMDBDataset:
-                #   ode_latent: [B, 1, 21, 16, H_lat, W_lat] (last frame = clean first-frame latent)
-                #   img: [B, C, H, W]  (first frame RGB in [-1,1])
                 image_latent = batch["ode_latent"][:, -1][:, 0:1].to(
                     device=self.device, dtype=self.dtype)
                 initial_latent = image_latent
@@ -441,11 +497,19 @@ class DistillationTrainer:
                 self._maybe_build_x_bound(batch_size, cond, y=y)
 
         if self._audio_dit_offload:
-            self._move_module_to_device(self.master.audio_dit, self.device)
+            self._move_module_to_device(m.audio_dit, self.device)
         if self._bridge_offload:
-            self._move_module_to_device(self.master.dual_tower_bridge, self.device)
+            self._move_module_to_device(m.dual_tower_bridge, self.device)
 
-        print(f"[fwdbwd_one_step] initial_latent:{initial_latent.shape}")
+        print(f"[fwdbwd_one_step] initial_latent:{initial_latent.shape if initial_latent is not None else None}")
+        
+        if self._dp_size > 1 and self.step % 100 == 0:
+            import hashlib
+            data_hash = hashlib.md5(str(text_prompts[0]).encode()).hexdigest()[:8]
+            print(f"[DP VERIFICATION] rank={self.global_rank}, dp_size={self._dp_size}, "
+                  f"batch_size={batch_size}, first_prompt_hash={data_hash}, "
+                  f"first_prompt='{text_prompts[0][:50]}...'")
+        
         if train_generator:
             loss, log = self.model.generator_loss(
                 image_or_video_shape=shape,
@@ -456,18 +520,27 @@ class DistillationTrainer:
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
             loss.backward()
-            active = self.model.generator.video_dit_high if cfg.training_target == "high_noise" \
-                else self.model.generator.video_dit_low
+            active = self.model.generator.video_dit
             if hasattr(active, "clip_grad_norm_"):
                 grad_norm = active.clip_grad_norm_(self.max_grad_norm_generator)
             else:
                 raw_norm = torch.nn.utils.clip_grad_norm_(active.parameters(), self.max_grad_norm_generator)
                 grad_norm = torch.tensor(raw_norm)
+            
+            if self._dp_size > 1 and self.step % 100 == 0:
+                first_grad = None
+                for name, p in active.named_parameters():
+                    if p.grad is not None:
+                        first_grad = p.grad.flatten()[:5].tolist()
+                        first_grad_name = name
+                        break
+                print(f"[DP VERIFICATION] rank={self.global_rank}, loss={loss.item():.6f}, "
+                      f"grad_norm={grad_norm.item():.4f}, first_grad({first_grad_name})={first_grad}")
 
             if self._audio_dit_offload:
-                self._move_module_to_device(self.master.audio_dit, "cpu")
+                self._move_module_to_device(m.audio_dit, "cpu")
             if self._bridge_offload:
-                self._move_module_to_device(self.master.dual_tower_bridge, "cpu")
+                self._move_module_to_device(m.dual_tower_bridge, "cpu")
             print(f"[fwdbwd_one_step] generator_loss: {loss.detach()}, generator_grad_norm: {grad_norm.detach()}")
             log.update({"generator_loss": loss.detach(), "generator_grad_norm": grad_norm.detach()})
             return log
@@ -481,8 +554,7 @@ class DistillationTrainer:
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
             loss.backward()
-            active = self.model.fake_score.video_dit_high if cfg.training_target == "high_noise" \
-                else self.model.fake_score.video_dit_low
+            active = self.model.fake_score.video_dit
             if hasattr(active, "clip_grad_norm_"):
                 grad_norm = active.clip_grad_norm_(self.max_grad_norm_critic)
             else:
@@ -490,9 +562,9 @@ class DistillationTrainer:
                 grad_norm = torch.tensor(raw_norm)
 
             if self._audio_dit_offload:
-                self._move_module_to_device(self.master.audio_dit, "cpu")
+                self._move_module_to_device(m.audio_dit, "cpu")
             if self._bridge_offload:
-                self._move_module_to_device(self.master.dual_tower_bridge, "cpu")
+                self._move_module_to_device(m.dual_tower_bridge, "cpu")
 
             print(f"[fwdbwd_one_step] critic_loss: {loss.detach()}, critic_grad_norm: {grad_norm.detach()}")
             log.update({"critic_loss": loss.detach(), "critic_grad_norm": grad_norm.detach()})
@@ -502,10 +574,8 @@ class DistillationTrainer:
     # Save
     # ============================================================
     def save(self):
-        cfg = self.config
-        is_high = cfg.training_target == "high_noise"
-        gen_dit = self.model.generator.video_dit_high if is_high else self.model.generator.video_dit_low
-        crit_dit = self.model.fake_score.video_dit_high if is_high else self.model.fake_score.video_dit_low
+        gen_dit = self.model.generator.video_dit
+        crit_dit = self.model.fake_score.video_dit
 
         gen_sd = fsdp_state_dict(gen_dit)
         crit_sd = fsdp_state_dict(crit_dit)
@@ -515,7 +585,7 @@ class DistillationTrainer:
             state["generator_ema"] = self.generator_ema.state_dict()
 
         if self.is_main:
-            ckpt_dir = os.path.join(cfg.logdir, f"checkpoint_step_{self.step:06d}")
+            ckpt_dir = os.path.join(self.config.logdir, f"checkpoint_step_{self.step:06d}")
             os.makedirs(ckpt_dir, exist_ok=True)
             torch.save(state, os.path.join(ckpt_dir, "model.pt"))
             print(f"[Save] {ckpt_dir}/model.pt")
@@ -532,7 +602,6 @@ class DistillationTrainer:
 
         remaining_steps = max(0, start_step + max_steps - self.step)
 
-        # while self.step < start_step + max_steps:
         with tqdm(total=remaining_steps, initial=0, desc="Training", disable=not self.is_main) as pbar:
             for _ in range(remaining_steps):
                 train_gen = (self.step % cfg.dfake_gen_update_ratio == 0)
@@ -541,14 +610,11 @@ class DistillationTrainer:
                     self.generator_optimizer.zero_grad(set_to_none=True)
                     _ = self.fwdbwd_one_step(next(self.dataloader), True)
                     self.generator_optimizer.step()
-                    # EMA
                     if self.generator_ema is None and self.ema_weight > 0 and self.step >= self.ema_start_step:
-                        active = self.model.generator.video_dit_high if cfg.training_target == "high_noise" \
-                            else self.model.generator.video_dit_low
+                        active = self.model.generator.video_dit
                         self.generator_ema = (EMA_FSDP if self.world_size > 1 else EMA)(active, decay=self.ema_weight)
                     elif self.generator_ema is not None:
-                        active = self.model.generator.video_dit_high if cfg.training_target == "high_noise" \
-                            else self.model.generator.video_dit_low
+                        active = self.model.generator.video_dit
                         self.generator_ema.update(active)
 
                 self.critic_optimizer.zero_grad(set_to_none=True)
@@ -564,7 +630,6 @@ class DistillationTrainer:
                     gc.collect()
                     torch.cuda.empty_cache()
 
-                # 更新进度条及耗时信息（仅主进程）
                 if self.is_main:
                     now = time.time()
                     if self.previous_time is not None:

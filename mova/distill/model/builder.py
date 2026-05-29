@@ -1,53 +1,58 @@
 """
-Factory for building the multi-DiT MOVA distillation graph.
+Factory for building the MOVA distillation graph with single-model loading.
 
-The DMD distillation needs three (or four) *independent* video DiT copies that
-all share the heavyweight peripherals (text_encoder, audio_dit, dual_tower_bridge,
-video_vae, audio_vae, scheduler):
+When training in "high_noise" mode, only ``video_dit`` (high) is loaded and cloned.
+When training in "low_noise" mode,  only ``video_dit_2`` (low) is loaded and cloned.
 
-    generator         : trainable student     (video_dit + video_dit_2 owned)
-    real_score        : frozen teacher        (video_dit + video_dit_2 owned)
-    fake_score        : trainable critic      (video_dit + video_dit_2 owned)
-    high_noise_teacher: frozen distilled high-noise model used only in low-noise stage
+There is no centralized master pipeline. Each MOVAVideoDiTWrapper directly owns
+its single DiT and references shared resources (audio_dit, dual_tower_bridge,
+scheduler, etc.) for its self-contained inference.
 
-We achieve this by:
-    1. Loading one MOVATrain pipeline `master` from the pretrained checkpoint.
-    2. Cloning ONLY the video_dit / video_dit_2 weights into a separate
-       `MOVATrain`-shaped facade for each role.
-    3. Sharing the master's `text_encoder`, `audio_dit`, `dual_tower_bridge`,
-       `video_vae`, `audio_vae`, and `scheduler` by reference.
-
-Because video_dit is the only heavyweight component duplicated across roles, the
-peak memory cost of the distillation graph is roughly (1 master + 3 extra video_dits).
-With FSDP full-sharding across 8 H100s this is feasible at 720p/81f.
+    generator  : trainable student     — alias of the pretrained DiT
+    real_score : frozen teacher        — deep-copied from pretrained DiT
+    fake_score : trainable critic      — deep-copied from pretrained DiT
 """
 
 from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
+from typing import List, Optional, Union
 
 import torch
 import torch.nn as nn
 
-from mova.diffusion.pipelines.mova_train import MOVATrain, MOVATrain_from_pretrained
+from mova.diffusion.pipelines.mova_train import MOVATrain, MOVATrain_from_pretrained, prompt_clean
 from mova.distill.utils.scheduler_distill import FlowMatchSchedulerDistill
 
 
 @dataclass
 class MOVADistillModules:
-    """Container holding the four DiT roles plus the shared MOVATrain master."""
-    master: MOVATrain
-    generator_high: nn.Module       # trainable, alias of master.video_dit
-    generator_low: nn.Module        # trainable, alias of master.video_dit_2
-    real_high: nn.Module            # frozen teacher (deep-copied)
-    real_low: nn.Module             # frozen teacher (deep-copied)
-    fake_high: nn.Module            # trainable critic (deep-copied)
-    fake_low: nn.Module             # trainable critic (deep-copied)
+    """Container with single-model DiT roles + independent shared resources.
+
+    No centralized master pipeline — each role accesses shared resources
+    (audio_dit, dual_tower_bridge, etc.) by direct reference, and each
+    MOVAVideoDiTWrapper owns its inference logic internally.
+    """
+    training_target: str
+    generator_dit: nn.Module
+    real_dit: nn.Module
+    fake_dit: nn.Module
+
+    audio_dit: nn.Module
+    dual_tower_bridge: nn.Module
+    text_encoder: nn.Module
+    text_encoder_2: Optional[nn.Module]
+    tokenizer: object
+    video_vae: nn.Module
+    audio_vae: nn.Module
+    scheduler: FlowMatchSchedulerDistill
+
+    use_gradient_checkpointing: bool
+    use_gradient_checkpointing_offload: bool
 
 
 def _deepcopy_dit(module: nn.Module) -> nn.Module:
-    """Deep-copy a video DiT, then unconditionally freeze it."""
     cloned = copy.deepcopy(module)
     cloned.requires_grad_(False)
     cloned.eval()
@@ -55,8 +60,6 @@ def _deepcopy_dit(module: nn.Module) -> nn.Module:
 
 
 def _trainable_clone_dit(module: nn.Module) -> nn.Module:
-    """Deep-copy a video DiT for training (parameters new, but we keep .train()
-    state managed by the trainer)."""
     cloned = copy.deepcopy(module)
     cloned.requires_grad_(True)
     return cloned
@@ -64,19 +67,21 @@ def _trainable_clone_dit(module: nn.Module) -> nn.Module:
 
 def build_distill_modules(
     pretrained_path: str,
+    training_target: str = "high_noise",
     use_gradient_checkpointing: bool = True,
     use_gradient_checkpointing_offload: bool = False,
     torch_dtype: torch.dtype = torch.bfloat16,
     device: str = "cpu",
 ) -> MOVADistillModules:
-    """Load one MOVATrain pipeline from `pretrained_path` and produce the DMD
-    distillation module set. The returned `master` pipeline acts as the
-    *generator*; `real_*` and `fake_*` are deep-copied to be independent.
+    """Load ONE MOVATrain pipeline, extract shared resources, clone the active
+    DiT (*only* the one matching `training_target`), then discard the master.
 
-    Note: text_encoder / audio_dit / dual_tower_bridge / video_vae / audio_vae
-    remain referenced exclusively by `master`. The wrapper code in
-    `mova_dit_wrapper.py` swaps in the correct video_dit at forward time.
+    Args:
+        training_target: "high_noise" → loads ``master.video_dit``;
+                         "low_noise"  → loads ``master.video_dit_2``.
     """
+    assert training_target in {"high_noise", "low_noise"}
+
     master: MOVATrain = MOVATrain_from_pretrained(
         from_pretrained=pretrained_path,
         device=device,
@@ -85,58 +90,101 @@ def build_distill_modules(
         use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
     )
 
-    # Replace the default FlowMatchScheduler with the distill-aware version
-    # that has add_noise_high/low, get_train_sigmas, etc.
     orig = master.scheduler
-    master.scheduler = FlowMatchSchedulerDistill(
+    scheduler = FlowMatchSchedulerDistill(
         num_train_timesteps=getattr(orig, "num_train_timesteps", 1000),
         shift=getattr(orig, "shift", 5.0),
     )
 
-    # --- build clones ---
-    real_high = _deepcopy_dit(master.video_dit)
-    real_low = _deepcopy_dit(master.video_dit_2)
+    audio_dit = master.audio_dit
+    dual_tower_bridge = master.dual_tower_bridge
+    text_encoder = master.text_encoder
+    text_encoder_2 = getattr(master, "text_encoder_2", None)
+    tokenizer = getattr(master, "tokenizer", None)
+    video_vae = master.video_vae
+    audio_vae = master.audio_vae
 
-    fake_high = _trainable_clone_dit(master.video_dit)
-    fake_low = _trainable_clone_dit(master.video_dit_2)
+    if training_target == "high_noise":
+        pretrained_dit = master.video_dit
+    else:
+        pretrained_dit = master.video_dit_2
 
-    # --- generator points at master.video_dit / video_dit_2 (the trainable ones) ---
-    master.video_dit.requires_grad_(True)
-    master.video_dit_2.requires_grad_(True)
+    real_dit = _deepcopy_dit(pretrained_dit)
+    fake_dit = _trainable_clone_dit(pretrained_dit)
 
-    # The dual_tower_bridge and audio_dit are FROZEN during distillation (we are
-    # not retraining the cross-modal interaction; we only want the student video
-    # branches to match the teacher distribution).
-    master.dual_tower_bridge.requires_grad_(False)
-    master.audio_dit.requires_grad_(False)
-    master.text_encoder.requires_grad_(False)
-    master.video_vae.requires_grad_(False)
-    master.audio_vae.requires_grad_(False)
+    generator_dit = pretrained_dit
+    generator_dit.requires_grad_(True)
+
+    dual_tower_bridge.requires_grad_(False)
+    audio_dit.requires_grad_(False)
+    text_encoder.requires_grad_(False)
+    video_vae.requires_grad_(False)
+    audio_vae.requires_grad_(False)
 
     return MOVADistillModules(
-        master=master,
-        generator_high=master.video_dit,
-        generator_low=master.video_dit_2,
-        real_high=real_high,
-        real_low=real_low,
-        fake_high=fake_high,
-        fake_low=fake_low,
+        training_target=training_target,
+        generator_dit=generator_dit,
+        real_dit=real_dit,
+        fake_dit=fake_dit,
+        audio_dit=audio_dit,
+        dual_tower_bridge=dual_tower_bridge,
+        text_encoder=text_encoder,
+        text_encoder_2=text_encoder_2,
+        tokenizer=tokenizer,
+        video_vae=video_vae,
+        audio_vae=audio_vae,
+        scheduler=scheduler,
+        use_gradient_checkpointing=use_gradient_checkpointing,
+        use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
     )
 
 
-def swap_video_dit(pipeline: MOVATrain, *, high: nn.Module, low: nn.Module):
-    """
-    🔥 FSDP / DDP 唯一安全版本
-    只劫持 forward，不替换 module
-    权重永远保持正常形状，不会变成 1D / size [0]
-    """
-    # 保存原来的 forward
-    orig_high_forward = pipeline.video_dit.forward
-    orig_low_forward = pipeline.video_dit_2.forward
+def encode_text_prompts(
+    prompts: Union[str, List[str]],
+    tokenizer,
+    text_encoder: nn.Module,
+    device: torch.device,
+    dtype: Optional[torch.dtype] = None,
+    max_sequence_length: int = 512,
+    num_videos_per_prompt: int = 1,
+) -> torch.Tensor:
+    dtype = dtype or text_encoder.dtype
 
-    # 只替换 forward 方法！！！不碰模型本身！！！
-    pipeline.video_dit.forward = high.forward
-    pipeline.video_dit_2.forward = low.forward
+    prompts = [prompts] if isinstance(prompts, str) else list(prompts)
+    prompts = [prompt_clean(u) for u in prompts]
 
-    # 返回原始 forward，用于恢复
-    return orig_high_forward, orig_low_forward
+    text_inputs = tokenizer(
+        prompts,
+        padding="max_length",
+        max_length=max_sequence_length,
+        truncation=True,
+        add_special_tokens=True,
+        return_attention_mask=True,
+        return_tensors="pt",
+    )
+    text_input_ids = text_inputs.input_ids
+    mask = text_inputs.attention_mask
+    seq_lens = mask.gt(0).sum(dim=1).long()
+
+    prompt_embeds = text_encoder(text_input_ids.to(device), mask.to(device)).last_hidden_state
+    prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
+    prompt_embeds = [u[:v] for u, v in zip(prompt_embeds, seq_lens)]
+    prompt_embeds = torch.stack(
+        [torch.cat([u, u.new_zeros(max_sequence_length - u.size(0), u.size(1))]) for u in prompt_embeds], dim=0
+    )
+
+    _, seq_len, _ = prompt_embeds.shape
+    prompt_embeds = prompt_embeds.repeat(1, num_videos_per_prompt, 1)
+    prompt_embeds = prompt_embeds.view(len(prompts) * num_videos_per_prompt, seq_len, -1)
+
+    return prompt_embeds
+
+
+def normalize_video_latents(video_vae: nn.Module, latents: torch.Tensor) -> torch.Tensor:
+    mean = torch.tensor(video_vae.config.latents_mean, device=latents.device, dtype=latents.dtype).view(
+        1, video_vae.config.z_dim, 1, 1, 1
+    )
+    inv_std = (1.0 / torch.tensor(video_vae.config.latents_std, device=latents.device, dtype=latents.dtype)).view(
+        1, video_vae.config.z_dim, 1, 1, 1
+    )
+    return (latents - mean) * inv_std

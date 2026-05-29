@@ -71,6 +71,7 @@ class BidirectionalTrainingPipeline(torch.nn.Module):
         exit_idx = self._broadcast_exit_index(num_steps, device=noise.device)
 
         for index, current_timestep in enumerate(self.denoising_step_list):
+            print(f"[inference_with_trajectory] index:{index} current_timestep:{current_timestep}")
             timestep_id = (1000 - int(current_timestep)) * torch.ones(
                 noise.shape[:2], device=noise.device, dtype=torch.int64,
             )
@@ -101,8 +102,11 @@ class BidirectionalTrainingPipeline(torch.nn.Module):
                             next_timestep_id.flatten(0, 1),
                             self.timestep_bound,
                         ).unflatten(0, denoised_pred.shape[:2])
+                    del flow_pred, denoised_pred
+                    torch.cuda.empty_cache()
             else:
-                # last step kept WITH gradient → DMD loss flows here
+                from mova.distill.model.dmd import log_cuda_memory_simple
+                log_cuda_memory_simple(f'before generator call (index={index})')
                 flow_pred, denoised_pred = self.generator(
                     noisy_image_or_video=noisy,
                     conditional_dict=conditional_dict,
@@ -111,6 +115,7 @@ class BidirectionalTrainingPipeline(torch.nn.Module):
                     audio_latents=audio_latents,
                     cp_mesh=cp_mesh,
                 )
+                log_cuda_memory_simple(f'after generator call (index={index})')
                 break
 
         return flow_pred, denoised_pred

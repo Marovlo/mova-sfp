@@ -1,17 +1,16 @@
 """
-MOVA Video-DiT wrapper for Self-Forcing-Plus style DMD distillation.
+MOVA single-model Video-DiT wrapper for SFP-style DMD distillation.
 
 A wrapper presents one role (generator / real_score / fake_score) as a self-
 contained module with the SFP `WanDiffusionWrapper` interface
 `forward(noisy_image_or_video, conditional_dict, timestep_id, ...) -> (flow_pred, x_pred)`.
 
-It owns its OWN `video_dit` and `video_dit_2` instances and, on every forward,
-temporarily swaps them into the SHARED `MOVATrain` master pipeline so that
-`inference_single_step` runs with the correct DiT while still using the master's
-`audio_dit`, `dual_tower_bridge`, `video_vae`, `text_encoder`, etc.
-
-Concurrency caveat: forward is *not* re-entrant across roles; the trainer calls
-each role serially (matches SFP's `fwdbwd_one_step` order).
+Key differences from the old dual-model architecture:
+  * Wraps a SINGLE DiT (no high/low pair).  The training_target is selected at
+    launch time and only the corresponding DiT is loaded.
+  * No master pipeline — shared resources (audio_dit, dual_tower_bridge, scheduler)
+    are passed by reference. Inference logic lives inside the wrapper itself.
+  * No swap_video_dit — each wrapper directly accesses its own DiT.
 """
 
 from __future__ import annotations
@@ -20,59 +19,58 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
+from torch.distributed.device_mesh import DeviceMesh
 
-from mova.diffusion.pipelines.mova_train import MOVATrain
-from mova.distill.model.builder import swap_video_dit
-
-
-class _SharedRefs:
-    """Plain-Python (non-nn.Module) holder so FSDP / .parameters() does not
-    descend into the master pipeline."""
-    __slots__ = ("pipeline",)
-
-    def __init__(self, pipeline: MOVATrain):
-        self.pipeline = pipeline
+from mova.diffusion.models import sinusoidal_embedding_1d
+from mova.distributed.functional import (
+    _sp_all_gather_avg,
+    _sp_split_tensor,
+    _sp_split_tensor_dim_0,
+)
+from mova.distill.utils.scheduler_distill import FlowMatchSchedulerDistill
 
 
 class MOVAVideoDiTWrapper(nn.Module):
-    """SFP-style wrapper around a (high-noise + low-noise) pair of video DiTs
-    that runs through MOVA's full dual-tower forward.
+    """SFP-style wrapper around a SINGLE video DiT with self-contained inference.
 
     Args:
-        master_pipeline: shared `MOVATrain` whose audio_dit / bridge / vaes / etc.
-                         we reuse on every forward call.
-        video_dit_high : the role's high-noise DiT (active when target=="high_noise").
-        video_dit_low  : the role's low-noise DiT  (active when target=="low_noise").
-        target         : "high_noise" or "low_noise".
+        video_dit : the role's DiT.
+        target    : "high_noise" or "low_noise" (determines x0 vs x_bound conversion).
         boundary_step  : raw boundary step (0..1000) used to compute x_bound.
         timestep_shift : sigma shift used by the FlowMatchScheduler.
+        audio_dit     : shared frozen audio DiT.
+        dual_tower_bridge : shared frozen dual-tower bridge.
+        scheduler     : FlowMatchSchedulerDistill instance.
+        use_gradient_checkpointing        : forward via checkpoint.
+        use_gradient_checkpointing_offload: offload activations to CPU.
     """
 
     def __init__(
         self,
-        master_pipeline: MOVATrain,
-        video_dit_high: nn.Module,
-        video_dit_low: nn.Module,
+        video_dit: nn.Module,
         target: str = "high_noise",
         boundary_step: int = 900,
         timestep_shift: float = 5.0,
+        audio_dit: Optional[nn.Module] = None,
+        dual_tower_bridge: Optional[nn.Module] = None,
+        scheduler: Optional[FlowMatchSchedulerDistill] = None,
+        use_gradient_checkpointing: bool = True,
+        use_gradient_checkpointing_offload: bool = True,
     ):
         super().__init__()
         assert target in {"high_noise", "low_noise"}
 
-        self._refs = _SharedRefs(master_pipeline)
         self.target = target
         self.timestep_shift = timestep_shift
+        self.use_gradient_checkpointing = use_gradient_checkpointing
+        self.use_gradient_checkpointing_offload = use_gradient_checkpointing_offload
 
-        # Own both video DiTs as our submodules. The trainer decides which
-        # roles' wrappers see `requires_grad=True` (real_score wrappers freeze
-        # both, generator/fake_score wrappers train both).
-        self.add_module("video_dit_high", video_dit_high)
-        self.add_module("video_dit_low", video_dit_low)
+        self.add_module("video_dit", video_dit)
+        self.model = self.video_dit
 
-        # `.model` alias keeps SFP-style trainer code that does
-        # `self.model.generator.parameters()` happy.
-        self.model = self.video_dit_high if target == "high_noise" else self.video_dit_low
+        self.audio_dit = audio_dit
+        self.dual_tower_bridge = dual_tower_bridge
+        self.scheduler = scheduler
 
         self.timestep_bound = torch.tensor([boundary_step], dtype=torch.float64)
         if timestep_shift > 1:
@@ -82,19 +80,13 @@ class MOVAVideoDiTWrapper(nn.Module):
                 / (1 + (timestep_shift - 1) * (self.timestep_bound / 1000.0))
                 * 1000.0
             )
-
-        self.scheduler = master_pipeline.scheduler
-
-    @property
-    def pipeline(self) -> MOVATrain:
-        return self._refs.pipeline
+        self.training = True
 
     def enable_gradient_checkpointing(self) -> None:
-        # MOVA reads gradient checkpointing flags off the pipeline; nothing to do.
         return
 
     # ------------------------------------------------------------
-    # Conversion helpers (flow_pred → x0 / x_bound) — match SFP semantics.
+    # Conversion helpers
     # ------------------------------------------------------------
     def _convert_flow_pred_to_x0(self, flow_pred, xt, timestep):
         original_dtype = flow_pred.dtype
@@ -124,41 +116,307 @@ class MOVAVideoDiTWrapper(nn.Module):
         return x_bound.to(original_dtype)
 
     # ------------------------------------------------------------
+    # Self-contained inference (migrated from MOVATrain)
+    # ------------------------------------------------------------
+    def _forward_dual_tower_dit(
+        self,
+        visual_dit,
+        visual_x: torch.Tensor,
+        audio_x: torch.Tensor,
+        visual_context: torch.Tensor,
+        audio_context: torch.Tensor,
+        visual_t_mod: torch.Tensor,
+        audio_t_mod: Optional[torch.Tensor],
+        visual_freqs: torch.Tensor,
+        audio_freqs: torch.Tensor,
+        grid_size: tuple,
+        video_fps: float,
+        condition_scale: Optional[float] = 1.0,
+        a2v_condition_scale: Optional[float] = None,
+        v2a_condition_scale: Optional[float] = None,
+        cp_mesh: Optional[DeviceMesh] = None,
+    ):
+        min_layers = min(len(visual_dit.blocks), len(self.audio_dit.blocks))
+        visual_layers = len(visual_dit.blocks)
+
+        sp_enabled = False
+        sp_group = None
+        sp_rank = 0
+        sp_size = 1
+        visual_pad_len = 0
+        audio_pad_len = 0
+
+        if self.dual_tower_bridge.apply_cross_rope:
+            (visual_rope_cos_sin, audio_rope_cos_sin) = self.dual_tower_bridge.build_aligned_freqs(
+                video_fps=video_fps,
+                grid_size=grid_size,
+                audio_steps=audio_x.shape[1],
+                device=visual_x.device,
+                dtype=visual_x.dtype,
+            )
+        else:
+            visual_rope_cos_sin = None
+            audio_rope_cos_sin = None
+
+        if cp_mesh is not None:
+            sp_rank = cp_mesh.get_local_rank()
+            sp_size = cp_mesh.size()
+            sp_group = cp_mesh.get_group()
+            visual_x, visual_chunk_len, visual_pad_len, _ = _sp_split_tensor(visual_x, sp_size=sp_size, sp_rank=sp_rank)
+            audio_x, audio_chunk_len, audio_pad_len, _ = _sp_split_tensor(audio_x, sp_size=sp_size, sp_rank=sp_rank)
+            visual_freqs, _, _, _ = _sp_split_tensor_dim_0(visual_freqs, sp_size=sp_size, sp_rank=sp_rank)
+            audio_freqs, _, _, _ = _sp_split_tensor_dim_0(audio_freqs, sp_size=sp_size, sp_rank=sp_rank)
+            if visual_rope_cos_sin is not None:
+                visual_rope_cos_sin = [
+                    _sp_split_tensor(rope_cos_sin, sp_size=sp_size, sp_rank=sp_rank)[0]
+                    for rope_cos_sin in visual_rope_cos_sin
+                ]
+            if audio_rope_cos_sin is not None:
+                audio_rope_cos_sin = [
+                    _sp_split_tensor(rope_cos_sin, sp_size=sp_size, sp_rank=sp_rank)[0]
+                    for rope_cos_sin in audio_rope_cos_sin
+                ]
+            if len(visual_t_mod.shape) == 4:
+                visual_t_mod, _, _, _ = _sp_split_tensor(visual_t_mod, sp_size=sp_size, sp_rank=sp_rank)
+            sp_enabled = True
+
+        def _make_custom_forward(module):
+            def _fn(*inputs):
+                return module(*inputs)
+            return _fn
+
+        for layer_idx in range(min_layers):
+            visual_block = visual_dit.blocks[layer_idx]
+            audio_block = self.audio_dit.blocks[layer_idx]
+
+            if self.dual_tower_bridge.should_interact(layer_idx, 'a2v'):
+                def _bridge_positional(layer_idx_arg, visual_arg, audio_arg):
+                    return self.dual_tower_bridge(
+                        layer_idx_arg,
+                        visual_arg,
+                        audio_arg,
+                        x_freqs=visual_rope_cos_sin,
+                        y_freqs=audio_rope_cos_sin,
+                        a2v_condition_scale=a2v_condition_scale,
+                        v2a_condition_scale=v2a_condition_scale,
+                        condition_scale=condition_scale,
+                        video_grid_size=grid_size,
+                    )
+
+                print(f'[_forward_dual_tower_dit] use_gradient_checkpointing:{self.use_gradient_checkpointing} training:{self.training} use_gradient_checkpointing_offload:{self.use_gradient_checkpointing_offload}')
+                if self.use_gradient_checkpointing and self.training:
+                    if self.use_gradient_checkpointing_offload:
+                        with torch.autograd.graph.save_on_cpu():
+                            visual_x, audio_x = torch.utils.checkpoint.checkpoint(
+                                _bridge_positional,
+                                layer_idx,
+                                visual_x,
+                                audio_x,
+                                use_reentrant=False,
+                            )
+                    else:
+                        visual_x, audio_x = torch.utils.checkpoint.checkpoint(
+                            _bridge_positional,
+                            layer_idx,
+                            visual_x,
+                            audio_x,
+                            use_reentrant=False,
+                        )
+                else:
+                    visual_x, audio_x = self.dual_tower_bridge(
+                        layer_idx,
+                        visual_x,
+                        audio_x,
+                        x_freqs=visual_rope_cos_sin,
+                        y_freqs=audio_rope_cos_sin,
+                        a2v_condition_scale=a2v_condition_scale,
+                        v2a_condition_scale=v2a_condition_scale,
+                        condition_scale=condition_scale,
+                        video_grid_size=grid_size,
+                    )
+
+            if self.use_gradient_checkpointing and self.training:
+                if self.use_gradient_checkpointing_offload:
+                    with torch.autograd.graph.save_on_cpu():
+                        visual_x = torch.utils.checkpoint.checkpoint(
+                            _make_custom_forward(visual_block),
+                            visual_x, visual_context, visual_t_mod, visual_freqs,
+                            use_reentrant=False,
+                        )
+                else:
+                    visual_x = torch.utils.checkpoint.checkpoint(
+                        _make_custom_forward(visual_block),
+                        visual_x, visual_context, visual_t_mod, visual_freqs,
+                        use_reentrant=False,
+                    )
+            else:
+                visual_x = visual_block(visual_x, visual_context, visual_t_mod, visual_freqs)
+
+            if self.use_gradient_checkpointing and self.training:
+                if self.use_gradient_checkpointing_offload:
+                    with torch.autograd.graph.save_on_cpu():
+                        audio_x = torch.utils.checkpoint.checkpoint(
+                            _make_custom_forward(audio_block),
+                            audio_x, audio_context, audio_t_mod, audio_freqs,
+                            use_reentrant=False,
+                        )
+                else:
+                    audio_x = torch.utils.checkpoint.checkpoint(
+                        _make_custom_forward(audio_block),
+                        audio_x, audio_context, audio_t_mod, audio_freqs,
+                        use_reentrant=False,
+                    )
+            else:
+                audio_x = audio_block(audio_x, audio_context, audio_t_mod, audio_freqs)
+
+        for layer_idx in range(min_layers, visual_layers):
+            visual_block = visual_dit.blocks[layer_idx]
+            if self.use_gradient_checkpointing and self.training:
+                if self.use_gradient_checkpointing_offload:
+                    with torch.autograd.graph.save_on_cpu():
+                        visual_x = torch.utils.checkpoint.checkpoint(
+                            _make_custom_forward(visual_block),
+                            visual_x, visual_context, visual_t_mod, visual_freqs,
+                            use_reentrant=False,
+                        )
+                else:
+                    visual_x = torch.utils.checkpoint.checkpoint(
+                        _make_custom_forward(visual_block),
+                        visual_x, visual_context, visual_t_mod, visual_freqs,
+                        use_reentrant=False,
+                    )
+            else:
+                visual_x = visual_block(visual_x, visual_context, visual_t_mod, visual_freqs)
+
+        if sp_enabled:
+            visual_x_full = _sp_all_gather_avg(visual_x, sp_group=sp_group, pad_len=visual_pad_len)
+            audio_x_full = _sp_all_gather_avg(audio_x, sp_group=sp_group, pad_len=audio_pad_len)
+        else:
+            visual_x_full = visual_x
+            audio_x_full = audio_x
+
+        return visual_x_full, audio_x_full
+
+    def _inference_single_step(
+        self,
+        visual_dit,
+        visual_latents: torch.Tensor,
+        audio_latents: Optional[torch.Tensor],
+        y,
+        context: torch.Tensor,
+        timestep: torch.Tensor,
+        audio_timestep: Optional[torch.Tensor],
+        video_fps: float,
+        cp_mesh=None,
+    ):
+        audio_context = visual_context = context
+
+        if audio_timestep is None:
+            audio_timestep = timestep
+
+        model_dtype = torch.bfloat16
+        with torch.autocast("cuda", dtype=torch.float32):
+            visual_t = visual_dit.time_embedding(sinusoidal_embedding_1d(visual_dit.freq_dim, timestep))
+            visual_t_mod = visual_dit.time_projection(visual_t).unflatten(1, (6, visual_dit.dim))
+
+            audio_t = self.audio_dit.time_embedding(sinusoidal_embedding_1d(self.audio_dit.freq_dim, audio_timestep))
+            audio_t_mod = self.audio_dit.time_projection(audio_t).unflatten(1, (6, self.audio_dit.dim))
+
+        visual_t = visual_t.to(model_dtype)
+        visual_t_mod = visual_t_mod.to(model_dtype)
+        audio_t = audio_t.to(model_dtype)
+        audio_t_mod = audio_t_mod.to(model_dtype)
+
+        visual_context_emb = visual_dit.text_embedding(visual_context)
+        audio_context_emb = self.audio_dit.text_embedding(audio_context)
+
+        visual_x = visual_latents.to(dtype=model_dtype, device=visual_latents.device)
+        if audio_latents is None:
+            B = visual_latents.shape[0]
+            audio_in_dim = getattr(self.audio_dit.config, 'in_dim', 128)  # ← 从 audio_dit config 获取
+            audio_steps = 403
+            audio_latents = torch.zeros(
+                B, audio_in_dim, audio_steps,
+                device=visual_latents.device, dtype=model_dtype
+            )
+        audio_x = audio_latents.to(dtype=model_dtype, device=audio_latents.device)
+        if visual_dit.require_vae_embedding:
+            visual_x = torch.cat([visual_x, y], dim=1).to(dtype=model_dtype, device=visual_latents.device)
+
+        visual_x, (t, h, w) = visual_dit.patchify(visual_x)
+        grid_size = (t, h, w)
+
+        visual_freqs = tuple(freq.to(visual_x.device) for freq in visual_dit.freqs)
+        visual_freqs = torch.cat([
+            visual_freqs[0][:t].view(t, 1, 1, -1).expand(t, h, w, -1),
+            visual_freqs[1][:h].view(1, h, 1, -1).expand(t, h, w, -1),
+            visual_freqs[2][:w].view(1, 1, w, -1).expand(t, h, w, -1)
+        ], dim=-1).reshape(t * h * w, 1, -1).to(visual_x.device)
+
+        audio_x, (f,) = self.audio_dit.patchify(audio_x, None)
+
+        audio_freqs = torch.cat(
+            [
+                self.audio_dit.freqs[0][:f].view(f, -1).expand(f, -1),
+                self.audio_dit.freqs[1][:f].view(f, -1).expand(f, -1),
+                self.audio_dit.freqs[2][:f].view(f, -1).expand(f, -1),
+            ],
+            dim=-1
+        ).reshape(f, 1, -1).to(audio_x.device)
+
+        from mova.distill.model.dmd import log_cuda_memory_simple
+        log_cuda_memory_simple('_inference_single_step BEFORE _forward_dual_tower_dit')
+        
+        visual_x, audio_x = self._forward_dual_tower_dit(
+            visual_dit=visual_dit,
+            visual_x=visual_x,
+            audio_x=audio_x,
+            visual_context=visual_context_emb,
+            audio_context=audio_context_emb,
+            visual_t_mod=visual_t_mod,
+            audio_t_mod=audio_t_mod,
+            visual_freqs=visual_freqs,
+            audio_freqs=audio_freqs,
+            grid_size=grid_size,
+            video_fps=video_fps,
+            cp_mesh=cp_mesh,
+        )
+        
+        log_cuda_memory_simple('_inference_single_step AFTER _forward_dual_tower_dit')
+
+        visual_output = visual_dit.head(visual_x, visual_t)
+        visual_output = visual_dit.unpatchify(visual_output, grid_size)
+
+        audio_output = self.audio_dit.head(audio_x, audio_t)
+        audio_output = self.audio_dit.unpatchify(audio_output, (f,))
+
+        return visual_output, audio_output
+
+    # ------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------
     def forward(
         self,
-        noisy_image_or_video: torch.Tensor,           # [B, F, C, H, W] (SFP layout)
-        conditional_dict: dict,                       # {"prompt_embeds": [B, L, D]}
-        timestep_id: torch.Tensor,                    # [B, F] long, indexes the train_timesteps table
-        y: Optional[torch.Tensor] = None,             # I2V first-frame embed [B, 20, F, H, W] (BCFHW)
-        audio_latents: Optional[torch.Tensor] = None, # [B, A_dim, A_T]
+        noisy_image_or_video: torch.Tensor,
+        conditional_dict: dict,
+        timestep_id: torch.Tensor,
+        y: Optional[torch.Tensor] = None,
+        audio_latents: Optional[torch.Tensor] = None,
         audio_timestep_id: Optional[torch.Tensor] = None,
         cp_mesh=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        pipe = self.pipeline
-
-        # --- timestep mapping (table -> values) ---
         train_timesteps = self.scheduler.get_train_timesteps(noisy_image_or_video.device)
-        timestep_vals = train_timesteps[timestep_id]   # [B, F]
-        input_timestep = timestep_vals[:, 0]           # [B] (uniform across F for bidirectional)
+        timestep_vals = train_timesteps[timestep_id]
+        input_timestep = timestep_vals[:, 0]
 
-        # SFP layout [B, F, C, H, W] → MOVA layout [B, C, F, H, W]
         visual_bcfhw = noisy_image_or_video.permute(0, 2, 1, 3, 4).contiguous()
 
-        # I2V: the noisy input has F-1 frames (first frame is clean, provided by
-        # initial_latent). MOVA's inference_single_step expects visual_latents to
-        # have the FULL F frames (it concats with y on channel dim, requiring
-        # matching temporal dim). So we prepend initial_latent to restore F frames.
         initial_latent = conditional_dict.get("initial_latent", None)
         if initial_latent is not None:
-            # initial_latent: [B, 1, C, H, W] (SFP layout) → [B, C, 1, H, W] (MOVA layout)
             first_frame_bcfhw = initial_latent.permute(0, 2, 1, 3, 4).contiguous().to(
                 device=visual_bcfhw.device, dtype=visual_bcfhw.dtype)
-            visual_bcfhw = torch.cat([first_frame_bcfhw, visual_bcfhw], dim=2)  # [B, C, F, H, W]
+            visual_bcfhw = torch.cat([first_frame_bcfhw, visual_bcfhw], dim=2)
 
-        # First-frame condition. The pipeline's inference_single_step expects a
-        # tensor `y` with 20 channels (4 mask + 16 vae) when require_vae_embedding.
         if y is None:
             B, _C, F_lat, H_lat, W_lat = visual_bcfhw.shape
             y = torch.zeros(
@@ -166,57 +424,33 @@ class MOVAVideoDiTWrapper(nn.Module):
                 device=visual_bcfhw.device, dtype=visual_bcfhw.dtype,
             )
 
-        # Audio condition. For T2V distillation we feed zero audio latents so the
-        # bridge has a well-defined input but contributes nothing meaningful. The
-        # audio_dit branch is frozen, so this is gradient-safe.
-        if audio_latents is None:
-            B = visual_bcfhw.shape[0]
-            audio_dim = pipe.audio_vae.latent_dim
-            audio_steps = getattr(pipe, "_distill_audio_steps", 403)
-            audio_latents = torch.zeros(
-                B, audio_dim, audio_steps,
-                device=visual_bcfhw.device, dtype=visual_bcfhw.dtype,
-            )
+        context = conditional_dict["prompt_embeds"]
+        video_fps = 24.0
+
         if audio_timestep_id is None:
             audio_timestep_id = timestep_id
         audio_timestep_vals = train_timesteps[audio_timestep_id]
         audio_input_timestep = audio_timestep_vals[:, 0]
 
-        context = conditional_dict["prompt_embeds"]
-        video_fps = getattr(pipe, "_distill_video_fps", 24.0)
+        from mova.distill.model.dmd import log_cuda_memory_simple
+        log_cuda_memory_simple('MOVAVideoDiTWrapper.forward BEFORE _inference_single_step')
+        
+        flow_pred_bcfhw, _audio_pred = self._inference_single_step(
+            visual_dit=self.video_dit,
+            visual_latents=visual_bcfhw,
+            audio_latents=audio_latents,
+            y=y,
+            context=context,
+            timestep=input_timestep,
+            audio_timestep=audio_input_timestep,
+            video_fps=video_fps,
+            cp_mesh=cp_mesh,
+        )
+        
+        log_cuda_memory_simple('MOVAVideoDiTWrapper.forward AFTER _inference_single_step')
 
-        # Pick the active DiT for this forward pass.
-        active_high = self.video_dit_high
-        active_low = self.video_dit_low
-        active_visual_dit = active_high if self.target == "high_noise" else active_low
-
-        # Swap the master's video DiT references so that inference_single_step
-        # uses *our* DiTs. We restore on exit (also on exception).
-        prev_high_forward, prev_low_forward = swap_video_dit(pipe, high=active_high, low=active_low)
-
-        try:
-            flow_pred_bcfhw, _audio_pred = pipe.inference_single_step(
-                visual_dit=active_visual_dit,
-                visual_latents=visual_bcfhw,
-                audio_latents=audio_latents,
-                y=y,
-                context=context,
-                timestep=input_timestep,
-                audio_timestep=audio_input_timestep,
-                video_fps=video_fps,
-                cp_mesh=cp_mesh,
-                is_training=True
-            )
-        finally:
-            self.video_dit_high.forward = prev_high_forward
-            self.video_dit_low.forward = prev_low_forward
-
-        # MOVA layout → SFP layout
         flow_pred = flow_pred_bcfhw.permute(0, 2, 1, 3, 4).contiguous()
 
-        # I2V: we prepended initial_latent, so the output has F frames but
-        # the caller expects F-1 frames (matching the input noisy). Strip the
-        # first-frame prediction (it's trivial / clean and not used by DMD).
         if initial_latent is not None:
             flow_pred = flow_pred[:, 1:, ...]
 
@@ -235,9 +469,6 @@ class MOVAVideoDiTWrapper(nn.Module):
 
         return flow_pred, x_pred
 
-    # ------------------------------------------------------------
-    # FSDP grad clip helper
-    # ------------------------------------------------------------
     def clip_grad_norm_(self, max_norm: float):
         if hasattr(self.model, "clip_grad_norm_"):
             return self.model.clip_grad_norm_(max_norm)
