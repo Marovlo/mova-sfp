@@ -80,7 +80,6 @@ class MOVAVideoDiTWrapper(nn.Module):
                 / (1 + (timestep_shift - 1) * (self.timestep_bound / 1000.0))
                 * 1000.0
             )
-        self.training = True
 
     def enable_gradient_checkpointing(self) -> None:
         return
@@ -185,48 +184,23 @@ class MOVAVideoDiTWrapper(nn.Module):
                 return module(*inputs)
             return _fn
 
+        self.audio_dit.eval()
+        self.dual_tower_bridge.eval()
+
         for layer_idx in range(min_layers):
             visual_block = visual_dit.blocks[layer_idx]
             audio_block = self.audio_dit.blocks[layer_idx]
 
+            # ========== Bridge 交互 (无需梯度) ==========
             if self.dual_tower_bridge.should_interact(layer_idx, 'a2v'):
-                def _bridge_positional(layer_idx_arg, visual_arg, audio_arg):
-                    return self.dual_tower_bridge(
-                        layer_idx_arg,
-                        visual_arg,
-                        audio_arg,
-                        x_freqs=visual_rope_cos_sin,
-                        y_freqs=audio_rope_cos_sin,
-                        a2v_condition_scale=a2v_condition_scale,
-                        v2a_condition_scale=v2a_condition_scale,
-                        condition_scale=condition_scale,
-                        video_grid_size=grid_size,
-                    )
-
-                print(f'[_forward_dual_tower_dit] use_gradient_checkpointing:{self.use_gradient_checkpointing} training:{self.training} use_gradient_checkpointing_offload:{self.use_gradient_checkpointing_offload}')
-                if self.use_gradient_checkpointing and self.training:
-                    if self.use_gradient_checkpointing_offload:
-                        with torch.autograd.graph.save_on_cpu():
-                            visual_x, audio_x = torch.utils.checkpoint.checkpoint(
-                                _bridge_positional,
-                                layer_idx,
-                                visual_x,
-                                audio_x,
-                                use_reentrant=False,
-                            )
-                    else:
-                        visual_x, audio_x = torch.utils.checkpoint.checkpoint(
-                            _bridge_positional,
-                            layer_idx,
-                            visual_x,
-                            audio_x,
-                            use_reentrant=False,
-                        )
-                else:
-                    visual_x, audio_x = self.dual_tower_bridge(
+                with torch.no_grad():
+                    visual_x_detached = visual_x.detach()
+                    audio_x_detached = audio_x.detach()
+                    
+                    bridge_out_visual, bridge_out_audio = self.dual_tower_bridge(
                         layer_idx,
-                        visual_x,
-                        audio_x,
+                        visual_x_detached,
+                        audio_x_detached,
                         x_freqs=visual_rope_cos_sin,
                         y_freqs=audio_rope_cos_sin,
                         a2v_condition_scale=a2v_condition_scale,
@@ -234,10 +208,15 @@ class MOVAVideoDiTWrapper(nn.Module):
                         condition_scale=condition_scale,
                         video_grid_size=grid_size,
                     )
+                
+                visual_x = visual_x + (bridge_out_visual - visual_x_detached)
+                audio_x = bridge_out_audio
 
-            if self.use_gradient_checkpointing and self.training:
+            # ========== Visual Block (需要梯度 + checkpoint) ==========
+            if self.use_gradient_checkpointing and torch.is_grad_enabled():
                 if self.use_gradient_checkpointing_offload:
                     with torch.autograd.graph.save_on_cpu():
+                        print(f"[{layer_idx}/{min_layers}] layer visual_block")
                         visual_x = torch.utils.checkpoint.checkpoint(
                             _make_custom_forward(visual_block),
                             visual_x, visual_context, visual_t_mod, visual_freqs,
@@ -252,27 +231,17 @@ class MOVAVideoDiTWrapper(nn.Module):
             else:
                 visual_x = visual_block(visual_x, visual_context, visual_t_mod, visual_freqs)
 
-            if self.use_gradient_checkpointing and self.training:
-                if self.use_gradient_checkpointing_offload:
-                    with torch.autograd.graph.save_on_cpu():
-                        audio_x = torch.utils.checkpoint.checkpoint(
-                            _make_custom_forward(audio_block),
-                            audio_x, audio_context, audio_t_mod, audio_freqs,
-                            use_reentrant=False,
-                        )
-                else:
-                    audio_x = torch.utils.checkpoint.checkpoint(
-                        _make_custom_forward(audio_block),
-                        audio_x, audio_context, audio_t_mod, audio_freqs,
-                        use_reentrant=False,
-                    )
-            else:
+            # ========== Audio Block (无需梯度，直接前向) ==========
+            with torch.no_grad():  # ⚡ 不保存任何激活值，不走 checkpoint/offload
                 audio_x = audio_block(audio_x, audio_context, audio_t_mod, audio_freqs)
 
+
+        # ========== 剩余 Visual-only 层 (保持不变) ==========
         for layer_idx in range(min_layers, visual_layers):
             visual_block = visual_dit.blocks[layer_idx]
-            if self.use_gradient_checkpointing and self.training:
+            if self.use_gradient_checkpointing and torch.is_grad_enabled():
                 if self.use_gradient_checkpointing_offload:
+                    print(f"[{layer_idx}] remain layer visual_block")
                     with torch.autograd.graph.save_on_cpu():
                         visual_x = torch.utils.checkpoint.checkpoint(
                             _make_custom_forward(visual_block),
@@ -307,7 +276,7 @@ class MOVAVideoDiTWrapper(nn.Module):
         timestep: torch.Tensor,
         audio_timestep: Optional[torch.Tensor],
         video_fps: float,
-        cp_mesh=None,
+        cp_mesh=None
     ):
         audio_context = visual_context = context
 
@@ -365,7 +334,7 @@ class MOVAVideoDiTWrapper(nn.Module):
         ).reshape(f, 1, -1).to(audio_x.device)
 
         from mova.distill.model.dmd import log_cuda_memory_simple
-        log_cuda_memory_simple('_inference_single_step BEFORE _forward_dual_tower_dit')
+        log_cuda_memory_simple('before _forward_dual_tower_dit')
         
         visual_x, audio_x = self._forward_dual_tower_dit(
             visual_dit=visual_dit,
@@ -381,8 +350,7 @@ class MOVAVideoDiTWrapper(nn.Module):
             video_fps=video_fps,
             cp_mesh=cp_mesh,
         )
-        
-        log_cuda_memory_simple('_inference_single_step AFTER _forward_dual_tower_dit')
+        log_cuda_memory_simple('after _forward_dual_tower_dit')
 
         visual_output = visual_dit.head(visual_x, visual_t)
         visual_output = visual_dit.unpatchify(visual_output, grid_size)
@@ -432,9 +400,6 @@ class MOVAVideoDiTWrapper(nn.Module):
         audio_timestep_vals = train_timesteps[audio_timestep_id]
         audio_input_timestep = audio_timestep_vals[:, 0]
 
-        from mova.distill.model.dmd import log_cuda_memory_simple
-        log_cuda_memory_simple('MOVAVideoDiTWrapper.forward BEFORE _inference_single_step')
-        
         flow_pred_bcfhw, _audio_pred = self._inference_single_step(
             visual_dit=self.video_dit,
             visual_latents=visual_bcfhw,
@@ -444,10 +409,8 @@ class MOVAVideoDiTWrapper(nn.Module):
             timestep=input_timestep,
             audio_timestep=audio_input_timestep,
             video_fps=video_fps,
-            cp_mesh=cp_mesh,
+            cp_mesh=cp_mesh
         )
-        
-        log_cuda_memory_simple('MOVAVideoDiTWrapper.forward AFTER _inference_single_step')
 
         flow_pred = flow_pred_bcfhw.permute(0, 2, 1, 3, 4).contiguous()
 
